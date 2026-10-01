@@ -5,7 +5,7 @@ import { mkdir, readFile, writeFile, readdir, rm, stat } from 'node:fs/promises'
 import Busboy from 'busboy';
 import {
   askReasoning, buildLatex, compileLatex, extractDocx,
-  repairLatex, validateLatex, validateUpload, LIMITS,
+  repairLatex, validateLatex, validateUpload, LIMITS, TEMPLATE_IDS,
 } from './pipeline.mjs';
 
 const root = path.resolve('.');
@@ -358,7 +358,7 @@ const server = http.createServer(async (req, res) => {
       await mkdir(dir, { recursive: true });
       const job = {
         id, filename: file.filename, size: file.size,
-        target: fields.target === 'acmart' ? 'acmart' : 'IEEEtran',
+        target: TEMPLATE_IDS.includes(fields.target) ? fields.target : 'IEEEtran',
         status: 'running', stage: 'Thinking', progress: 8,
         dir, buffer: file.buffer,
         bibBuffer: bibFile?.buffer ?? null,

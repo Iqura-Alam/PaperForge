@@ -136,7 +136,14 @@ function renderUploadPrompt() {
               <label class="bib-button" for="bib-input" id="bib-button-label">Choose .bib ${icons.arrow}</label>
               <span id="bib-name" class="bib-name"></span>
             </div>
-            <label class="select-wrap" style="margin-top:12px">Output template<select id="target-select"><option>IEEEtran</option><option>acmart</option></select></label>
+            <label class="select-wrap" style="margin-top:12px">Output template<select id="target-select">
+              <option value="IEEEtran">IEEE Conference / Transactions</option>
+              <option value="acmart">ACM Conference / Journal</option>
+              <option value="acl">ACL / EMNLP / NAACL</option>
+              <option value="springer">Springer LNCS</option>
+              <option value="icml">ICML / PMLR</option>
+              <option value="iclr">ICLR</option>
+            </select></label>
             <p class="upload-privacy">${icons.info} Files are deleted automatically after download (max 24 hours). Content is never used for training without consent.</p>
             <div class="demo-hint"><button class="text-button" id="demo-button" type="button">Try with demo data</button></div>
           </section>
@@ -272,7 +279,14 @@ function render() {
             <div class="file-actions">
               <label class="replace-button" for="manuscript-input-replace">Replace manuscript</label>
               <input id="manuscript-input-replace" type="file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" aria-label="Replace manuscript" hidden>
-              <label class="select-wrap">Output template<select id="target-select"><option ${job.target === 'IEEEtran' ? 'selected' : ''}>IEEEtran</option><option ${job.target === 'acmart' ? 'selected' : ''}>acmart</option></select></label>
+              <label class="select-wrap">Output template<select id="target-select">
+                <option value="IEEEtran" ${job.target === 'IEEEtran' ? 'selected' : ''}>IEEE Conference / Transactions</option>
+                <option value="acmart" ${job.target === 'acmart' ? 'selected' : ''}>ACM Conference / Journal</option>
+                <option value="acl" ${job.target === 'acl' ? 'selected' : ''}>ACL / EMNLP / NAACL</option>
+                <option value="springer" ${job.target === 'springer' ? 'selected' : ''}>Springer LNCS</option>
+                <option value="icml" ${job.target === 'icml' ? 'selected' : ''}>ICML / PMLR</option>
+                <option value="iclr" ${job.target === 'iclr' ? 'selected' : ''}>ICLR</option>
+              </select></label>
             </div>
           </section>
 
