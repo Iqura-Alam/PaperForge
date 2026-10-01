@@ -1,0 +1,17 @@
+{
+  "name": "paperforge",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/state.test.mjs tests/pipeline.test.mjs",
+    "build": "node scripts/build-check.mjs",
+    "lint": "node scripts/lint-check.mjs",
+    "dev": "node src/server.mjs",
+    "backend": "node src/server.mjs"
+  },
+  "dependencies": {
+    "busboy": "^1.6.0",
+    "mammoth": "^1.13.0"
+  }
+}

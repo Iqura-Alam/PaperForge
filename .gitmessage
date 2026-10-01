@@ -1,0 +1,4 @@
+# <type>(<scope>): <subject>
+#
+# Types: feat, fix, docs, style, refactor, test, chore, perf, ci, revert
+# Explain why in the body when the change is not obvious.

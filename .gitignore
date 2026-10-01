@@ -1,0 +1,6 @@
+.codex-local/
+node_modules/
+.env
+.env.local
+coverage/
+
