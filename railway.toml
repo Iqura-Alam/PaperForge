@@ -1,0 +1,17 @@
+# PaperForge — Railway Deployment
+
+# Railway will auto-detect this file and use it to configure the deployment.
+# Set the following environment variables in the Railway project settings:
+#   PORT        (Railway sets this automatically)
+#   GEMINI_API_KEY or OPENAI_API_KEY (optional — rule-based fallback if absent)
+#   NODE_ENV=production
+
+[build]
+builder = "DOCKERFILE"
+
+[deploy]
+startCommand = "node src/server.mjs"
+healthcheckPath = "/api/health"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
