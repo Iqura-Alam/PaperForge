@@ -74,12 +74,111 @@ export async function compileLatex({ source, jobDir, target = 'IEEEtran', timeou
   });
 }
 
+// Bounded rule-based repair — safe formatting fixes only; MUST NOT alter scientific content.
+const REPAIR_RULES = [
+  {
+    name: 'missing-usepackage-hyperref',
+    pattern: /Package hyperref Error/i,
+    apply: (src) => src.includes('\\usepackage{hyperref}') ? null
+      : { source: src.replace('\\begin{document}', '\\usepackage{hyperref}\n\\begin{document}'), description: 'Added missing \\usepackage{hyperref}.' },
+  },
+  {
+    name: 'undefined-control-sequence-backslash',
+    pattern: /Undefined control sequence.*\\textbackslash/i,
+    apply: (src) => {
+      const fixed = src.replaceAll('\\textbackslash{}', '{\\textbackslash}');
+      return fixed === src ? null : { source: fixed, description: 'Fixed \\textbackslash{} to {\\textbackslash} for compatibility.' };
+    },
+  },
+  {
+    name: 'missing-dollar-inserted',
+    pattern: /Missing \$ inserted/i,
+    apply: (src) => {
+      const fixed = src.replace(/(?<![\\$])([_^])(?![^$]*\$)/g, (m) => `$${m}$`);
+      return fixed === src ? null : { source: fixed, description: 'Wrapped unescaped math characters in dollar-math mode.' };
+    },
+  },
+  {
+    name: 'file-not-found-graphics',
+    pattern: /cannot find image file|File .* not found/i,
+    apply: (src) => {
+      const fixed = src.replace(/\\includegraphics\[[^\]]*\]\{[^}]+\}/g, '\\fbox{[Figure: asset path not found --- insert before submission]}');
+      return fixed === src ? null : { source: fixed, description: 'Replaced unresolved \\includegraphics paths with placeholder draft boxes.' };
+    },
+  },
+];
+
+export function repairLatex(source, compileLog) {
+  const repairs = [];
+  let current = source;
+  for (const rule of REPAIR_RULES) {
+    if (!rule.pattern.test(compileLog)) continue;
+    const result = rule.apply(current);
+    if (!result) continue;
+    current = result.source;
+    repairs.push({ rule: rule.name, description: result.description, approval: false });
+  }
+  return { source: current, repairs };
+}
+
+
+const REASONING_PROMPT = (jobId, findings, document) =>
+  `You are PaperForge's bounded academic conversion reviewer. Do not rewrite scientific content. ` +
+  `Review job ${jobId}. Return ONLY a JSON object with keys: summary (string), safeFixes (string[]), ` +
+  `approvalRequired (string[]), remainingIssues (string[]). ` +
+  `Findings: ${JSON.stringify(findings)}. ` +
+  `Stats: ${JSON.stringify({ figures: document.figures, tables: document.tables, references: document.references })}.`;
+
+function ruleBasedReasoning(findings) {
+  const issues = findings.filter((f) => f.severity !== 'pass');
+  return {
+    provider: 'rule-based',
+    model: null,
+    summary: issues.length === 0
+      ? 'All rule-based checks passed. No LLM provider configured.'
+      : `${issues.length} issue(s) detected by rule-based validation. Human review required for flagged content.`,
+    safeFixes: findings.filter((f) => f.severity === 'warning' && !f.approval).map((f) => f.title ?? f.rule),
+    approvalRequired: findings.filter((f) => f.approval || f.severity === 'error').map((f) => f.title ?? f.rule),
+    remainingIssues: issues.map((f) => f.detail ?? f.title),
+  };
+}
+
+async function callGemini(apiKey, prompt) {
+  const model = process.env.GEMINI_MODEL || 'gemini-1.5-pro';
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+  const body = { contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0 } };
+  const response = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  if (!response.ok) throw new Error(`Gemini API returned ${response.status}.`);
+  const payload = await response.json();
+  const text = payload.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
+  // Strip markdown fences if present
+  const cleaned = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+  try { return { provider: 'gemini', model, ...JSON.parse(cleaned) }; } catch {
+    return { provider: 'gemini', model, summary: text, safeFixes: [], approvalRequired: [], remainingIssues: [] };
+  }
+}
+
+async function callOpenAI(apiKey, prompt) {
+  const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${apiKey}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ model, messages: [{ role: 'user', content: prompt }], temperature: 0 }),
+  });
+  if (!response.ok) throw new Error(`OpenAI API returned ${response.status}.`);
+  const payload = await response.json();
+  const text = payload.choices?.[0]?.message?.content ?? '';
+  const cleaned = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+  try { return { provider: 'openai', model, ...JSON.parse(cleaned) }; } catch {
+    return { provider: 'openai', model, summary: text, safeFixes: [], approvalRequired: [], remainingIssues: [] };
+  }
+}
+
 export async function askReasoning({ findings, document, jobId }) {
-  const apiKey = process.env.OPENAI_API_KEY; const model = process.env.OPENAI_MODEL || 'gpt-5-mini';
-  const prompt = `You are PaperForge's bounded academic conversion reviewer. Do not rewrite scientific content. Review job ${jobId}. Return JSON with keys summary, safeFixes, approvalRequired, remainingIssues. Findings: ${JSON.stringify(findings)}. Stats: ${JSON.stringify({ figures: document.figures, tables: document.tables, references: document.references })}.`;
-  if (!apiKey) return { provider: 'unconfigured', model: null, summary: 'LLM reasoning is not configured. Rule-based validation completed; human review remains required for flagged content.', safeFixes: [], approvalRequired: findings.filter((finding) => finding.severity !== 'pass').map((finding) => finding.title), remainingIssues: findings.filter((finding) => finding.severity !== 'pass').map((finding) => finding.detail) };
-  const response = await fetch('https://api.openai.com/v1/responses', { method: 'POST', headers: { authorization: `Bearer ${apiKey}`, 'content-type': 'application/json' }, body: JSON.stringify({ model, input: prompt, temperature: 0 }) });
-  if (!response.ok) throw new Error(`LLM provider returned ${response.status}.`);
-  const payload = await response.json(); const text = payload.output_text ?? '';
-  try { return { provider: 'openai', model, ...JSON.parse(text) }; } catch { return { provider: 'openai', model, summary: text, safeFixes: [], approvalRequired: [], remainingIssues: [] }; }
+  const prompt = REASONING_PROMPT(jobId, findings, document);
+  const geminiKey = process.env.GEMINI_API_KEY;
+  const openaiKey = process.env.OPENAI_API_KEY;
+  if (geminiKey) return callGemini(geminiKey, prompt);
+  if (openaiKey) return callOpenAI(openaiKey, prompt);
+  return ruleBasedReasoning(findings);
 }
