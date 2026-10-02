@@ -51,3 +51,16 @@
 - [x] T032 Create `railway.toml` deployment manifest and `.env.example` documentation.
 - [x] T033 Expand test suite to 19 tests covering citation reconciliation, security, and all pipeline paths.
 - [x] T034 Reviewer sign-off: all 19 tests green, constitution compliance verified, GitHub push complete.
+
+## Phase 7: Convergence
+
+- [ ] T035 CRITICAL add per-job capability authorization, remove the public job index, and enforce protected reads, streams, chat, actions, downloads, rollback, approval, consent, and deletion in `src/server.mjs` per Constitution IV and T014 (contradicts).
+- [ ] T036 CRITICAL implement typed, allowlisted agent proposals with explicit Apply/Reject controls, deterministic execution, revision checks, recompile/revalidate, audit history, rollback, and a browser source editor/manual recovery path in `src/pipeline.mjs`, `src/server.mjs`, `src/app.js`, and `styles.css` per Constitution III, FR-007, and FR-010 (missing).
+- [ ] T037 CRITICAL replace false-positive build/lint gates with source syntax validation and add recorded RED/GREEN integration evidence so broken browser code cannot pass CI in `scripts/`, `package.json`, `.github/workflows/ci.yml`, and `docs/tdd/` per Constitution V, T022, and T034 (contradicts).
+- [ ] T038 preserve structured authors, affiliation references, emails, and exact consumed front-matter blocks without duplicating or deleting manuscript content in `src/pipeline.mjs` and fixtures per FR-003 (partial).
+- [ ] T039 render wrapped, width-bounded tables with header/caption metadata and explicit merged/nested-table review findings so IEEE/ACM columns cannot overlap surrounding text in `src/pipeline.mjs` and fixtures per FR-003 and Edge Cases (partial).
+- [ ] T040 extract every supported embedded DOCX image, validate its type, retain an asset manifest, and deliver a downloadable source ZIP containing `paper.tex`, images, bibliography, report, change log, and available PDF in `src/pipeline.mjs` and `src/server.mjs` per FR-003, FR-009, SC-004, and US3/AC3 (partial).
+- [ ] T041 update the Gemini adapter to a supported stable model, provide bounded job context, validate structured responses, and make rule-based fallback state visible without exposing secrets in `src/pipeline.mjs`, `src/server.mjs`, and `.env.example` per plan: reasoning adapter and Constitution III-IV (partial).
+- [ ] T042 complete the two-step upload and agent drawer controls, eliminate duplicate state declarations, preserve chat drafts/focus across updates, and expose real Apply/Reject/Edit actions with disabled/loading/error states in `src/app.js` and `styles.css` per US1/AC1-3, SC-002, and SC-005 (partial).
+- [ ] T043 add unit and API integration coverage for authorization, agent proposals, metadata mapping, width-bounded tables, image manifests, source ZIP contents, output editing, rollback, and rate limits in `tests/` per Constitution V and T022 (missing).
+- [ ] T044 run independent desktop/mobile keyboard browser flows for upload, multi-turn chat, Apply/Reject, manual edit, approvals, downloads, error recovery, and reload/reconnect; record tester and reviewer evidence before push per SC-001, SC-005, Constitution V-VI, and T034 (partial).

@@ -4,7 +4,8 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "test": "node --test tests/state.test.mjs tests/pipeline.test.mjs",
+    "test": "node --test tests/state.test.mjs tests/pipeline.test.mjs tests/convergence.test.mjs tests/api-security.test.mjs",
+    "test:coverage": "node --experimental-test-coverage --test tests/state.test.mjs tests/pipeline.test.mjs tests/convergence.test.mjs tests/api-security.test.mjs",
     "build": "node scripts/build-check.mjs",
     "lint": "node scripts/lint-check.mjs",
     "dev": "node src/server.mjs",

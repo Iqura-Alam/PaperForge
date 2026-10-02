@@ -1,31 +1,35 @@
 import http from 'node:http';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mkdir, readFile, writeFile, readdir, rm, stat } from 'node:fs/promises';
 import Busboy from 'busboy';
 import {
-  askReasoning, buildLatex, compileLatex, extractDocx,
-  repairLatex, validateLatex, validateUpload, chatWithAgent, LIMITS, TEMPLATE_IDS,
+  applyAgentProposal, askReasoning, buildLatex, chatWithAgent, compileLatex,
+  extractDocx, rejectAgentProposal, repairLatex, validateAgentProposal,
+  validateLatex, validateUpload, TEMPLATE_IDS,
 } from './pipeline.mjs';
+import { createZip } from './zip.mjs';
 
 const root = path.resolve('.');
 const jobsRoot = path.join(root, '.codex-local', 'jobs');
 const jobs = new Map();
-
-// SSE subscriber registry: jobId -> Set<response>
 const sseSubscribers = new Map();
+const requestWindows = new Map();
+const SESSION_COOKIE = 'paperforge_session';
+const SESSION_PATTERN = /^[A-Za-z0-9_-]{32,128}$/;
+const JSON_LIMIT = 64 * 1024;
+const SOURCE_LIMIT = 2 * 1024 * 1024;
+const MAX_CONCURRENT_JOBS = 5;
+const MAX_REPAIRS = 3;
+const RETENTION_MS = 24 * 60 * 60 * 1000;
+const activeJobCount = { value: 0 };
 
 await mkdir(jobsRoot, { recursive: true });
 
-// ---------------------------------------------------------------------------
-// Concurrency / rate limiting
-// ---------------------------------------------------------------------------
-const MAX_CONCURRENT_JOBS = 5;
-const activeJobCount = { value: 0 };
+class RequestError extends Error {
+  constructor(status, message) { super(message); this.status = status; }
+}
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 function json(res, status, payload) {
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
@@ -39,552 +43,518 @@ function safeName(value) {
   return path.basename(value ?? '').replace(/[^a-zA-Z0-9._-]/g, '_') || 'unnamed';
 }
 
-function publicJob(job) {
-  const { buffer, bibBuffer, document: doc, source, dir, approvalResolve, ...safe } = job;
+function sourceHash(source) {
+  return createHash('sha256').update(String(source ?? ''), 'utf8').digest('hex');
+}
+
+function parseCookies(req) {
+  const result = {};
+  for (const pair of String(req.headers.cookie ?? '').split(';')) {
+    const separator = pair.indexOf('=');
+    if (separator <= 0) continue;
+    result[pair.slice(0, separator).trim()] = decodeURIComponent(pair.slice(separator + 1).trim());
+  }
+  return result;
+}
+
+function sessionFor(req, res, create = false) {
+  const current = parseCookies(req)[SESSION_COOKIE];
+  if (current && SESSION_PATTERN.test(current)) return current;
+  if (!create) return null;
+  const sessionId = randomBytes(32).toString('base64url');
+  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+  res.setHeader('set-cookie', `${SESSION_COOKIE}=${sessionId}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400${secure}`);
+  return sessionId;
+}
+
+function publicProposal(proposal) {
+  if (!proposal) return undefined;
   return {
-    ...safe,
-    document: doc
-      ? {
-          figures: doc.figures,
-          tables: doc.tables.length,
-          references: doc.references,
-          imageHeavy: doc.imageHeavy,
-          authorInfo: doc.authorInfo,
-          imageMap: doc.imageMap,
-        }
-      : undefined,
-    compile: job.compile
-      ? { ok: job.compile.ok, pdf: job.compile.pdf, timedOut: job.compile.timedOut }
-      : undefined,
+    id: proposal.id, type: proposal.type, baseRevision: proposal.baseRevision,
+    rationale: proposal.rationale, confidence: proposal.confidence,
+    approvalRequired: proposal.approvalRequired, status: proposal.status,
+    createdAt: proposal.createdAt, appliedAt: proposal.appliedAt, rejectedAt: proposal.rejectedAt,
   };
 }
 
+function publicJob(job) {
+  const doc = job.document;
+  return {
+    id: job.id, filename: job.filename, size: job.size, target: job.target,
+    status: job.status, stage: job.stage, progress: job.progress,
+    createdAt: job.createdAt, updatedAt: job.updatedAt,
+    findings: job.findings ?? [], repairsUsed: job.repairsUsed ?? 0, repairLog: job.repairLog ?? [],
+    reasoning: job.reasoning ? {
+      provider: job.reasoning.provider, fallback: Boolean(job.reasoning.fallback), summary: job.reasoning.summary,
+      safeFixes: job.reasoning.safeFixes ?? [], approvalRequired: job.reasoning.approvalRequired ?? [],
+      remainingIssues: job.reasoning.remainingIssues ?? [],
+    } : undefined,
+    document: doc ? {
+      figures: doc.figures, tables: doc.tables?.length ?? 0, references: doc.references,
+      imageHeavy: doc.imageHeavy, authorInfo: doc.authorInfo,
+      assets: (doc.assetManifest ?? []).map(({ id, filename, mimeType, bytes, supported }) => ({ id, filename, mimeType, bytes, supported })),
+    } : undefined,
+    compile: job.compile ? { ok: job.compile.ok, pdf: job.compile.pdf, timedOut: job.compile.timedOut, notFound: job.compile.notFound } : undefined,
+    sourceRevision: job.sourceRevision ?? 0, sourceHash: job.sourceHash,
+    proposals: (job.proposals ?? []).map(publicProposal),
+    audit: (job.audit ?? []).map(({ source: _source, ...entry }) => entry),
+    outputs: {
+      source: Boolean(job.source),
+      sourceZip: ['ready', 'error', 'rolled-back'].includes(job.status) && Boolean(job.source),
+      pdf: Boolean(job.compile?.pdf), report: ['ready', 'error', 'rolled-back'].includes(job.status),
+      changelog: ['ready', 'error', 'rolled-back'].includes(job.status),
+    },
+    error: job.error,
+  };
+}
+
+function ownedJob(req, res, id) {
+  const sessionId = sessionFor(req, res, false);
+  if (!sessionId) { json(res, 401, { error: 'A PaperForge session is required.' }); return null; }
+  const job = jobs.get(id);
+  if (!job || job.ownerSessionId !== sessionId) { json(res, 404, { error: 'Job not found.' }); return null; }
+  return job;
+}
+
+function rateLimit(key, limit, windowMs) {
+  const now = Date.now();
+  const recent = (requestWindows.get(key) ?? []).filter((timestamp) => now - timestamp < windowMs);
+  if (recent.length >= limit) return false;
+  recent.push(now); requestWindows.set(key, recent); return true;
+}
+
 function emitSSE(jobId, eventName, payload) {
-  const subs = sseSubscribers.get(jobId);
-  if (!subs || subs.size === 0) return;
+  const subscribers = sseSubscribers.get(jobId);
+  if (!subscribers) return;
   const chunk = `event: ${eventName}\ndata: ${JSON.stringify(payload)}\n\n`;
-  for (const res of subs) {
-    try { res.write(chunk); } catch { subs.delete(res); }
+  for (const response of subscribers) {
+    try { response.write(chunk); } catch { subscribers.delete(response); }
   }
 }
 
 function pushJobUpdate(job) {
+  job.updatedAt = new Date().toISOString();
   emitSSE(job.id, 'job', publicJob(job));
 }
 
-// ---------------------------------------------------------------------------
-// Multipart upload parser
-// ---------------------------------------------------------------------------
 async function parseUpload(req) {
   return new Promise((resolve, reject) => {
     const fields = {};
     let manuscriptFile = null;
     let bibFile = null;
-    const parser = Busboy({ headers: req.headers, limits: { fileSize: 25 * 1024 * 1024, files: 2, fields: 5 } });
-
+    let settled = false;
+    const fail = (error) => { if (!settled) { settled = true; reject(error); } };
+    let parser;
+    try {
+      parser = Busboy({ headers: req.headers, limits: { fileSize: 25 * 1024 * 1024, files: 2, fields: 8, fieldSize: 8 * 1024 } });
+    } catch {
+      return reject(new RequestError(400, 'A multipart manuscript upload is required.'));
+    }
     parser.on('field', (name, value) => { fields[name] = value; });
     parser.on('file', (name, stream, info) => {
       const chunks = [];
       let size = 0;
+      let truncated = false;
       const fileData = { field: name, filename: safeName(info.filename), mimeType: info.mimeType, size: 0 };
       stream.on('data', (chunk) => { size += chunk.length; chunks.push(chunk); });
-      stream.on('limit', () => reject(new Error('File exceeds the 25 MB limit.')));
+      stream.on('limit', () => { truncated = true; fail(new RequestError(413, 'File exceeds the 25 MB limit.')); });
       stream.on('end', () => {
-        fileData.size = size;
-        fileData.buffer = Buffer.concat(chunks);
-        if (name === 'bibliography') { bibFile = fileData; } else { manuscriptFile = fileData; }
+        if (truncated) return;
+        fileData.size = size; fileData.buffer = Buffer.concat(chunks);
+        if (name === 'bibliography') bibFile = fileData;
+        else if (name === 'manuscript') manuscriptFile = fileData;
       });
     });
-    parser.on('error', reject);
-    parser.on('finish', () => manuscriptFile
-      ? resolve({ fields, file: manuscriptFile, bibFile })
-      : reject(new Error('No manuscript file was uploaded.')));
+    parser.on('filesLimit', () => fail(new RequestError(413, 'Upload contains too many files.')));
+    parser.on('error', () => fail(new RequestError(400, 'Upload could not be parsed.')));
+    parser.on('finish', () => {
+      if (settled) return;
+      settled = true;
+      if (!manuscriptFile) reject(new RequestError(400, 'No manuscript file was uploaded.'));
+      else resolve({ fields, file: manuscriptFile, bibFile });
+    });
     req.pipe(parser);
   });
 }
 
-// ---------------------------------------------------------------------------
-// Parse JSON body
-// ---------------------------------------------------------------------------
-async function parseJsonBody(req) {
+async function parseJsonBody(req, maxBytes = JSON_LIMIT) {
   return new Promise((resolve, reject) => {
     let body = '';
-    req.on('data', (chunk) => { body += chunk; });
-    req.on('end', () => {
-      try { resolve(JSON.parse(body)); } catch { reject(new Error('Invalid JSON body.')); }
+    let size = 0;
+    let tooLarge = false;
+    req.setEncoding('utf8');
+    req.on('data', (chunk) => {
+      size += Buffer.byteLength(chunk);
+      if (size > maxBytes) { tooLarge = true; return; }
+      body += chunk;
     });
-    req.on('error', reject);
+    req.on('end', () => {
+      if (tooLarge) return reject(new RequestError(413, `JSON body exceeds ${maxBytes} bytes.`));
+      try { resolve(JSON.parse(body || '{}')); } catch { reject(new RequestError(400, 'Invalid JSON body.')); }
+    });
+    req.on('error', () => reject(new RequestError(400, 'Request body could not be read.')));
   });
 }
 
-// ---------------------------------------------------------------------------
-// Bibliography citation-key reconciliation
-// ---------------------------------------------------------------------------
 function reconcileCitations(source, bibContent) {
   if (!bibContent) return { source, bibKeys: [], unresolved: [] };
-  const bibKeys = [...bibContent.matchAll(/@\w+\{\s*([^,\s]+)/g)].map((m) => m[1]);
+  const bibKeys = [...bibContent.matchAll(/@\w+\{\s*([^,\s]+)/g)].map((match) => match[1]);
   let patched = source;
-  if (!patched.includes('\\bibliography{')) {
-    patched = patched.replace('\\end{document}', '\\bibliographystyle{plain}\n\\bibliography{refs}\n\\end{document}');
-  }
-  const citeKeys = [...patched.matchAll(/\\cite\{([^}]+)\}/g)].flatMap((m) => m[1].split(',').map((k) => k.trim()));
-  const unresolved = citeKeys.filter((k) => !bibKeys.includes(k));
-  return { source: patched, bibKeys, unresolved };
+  if (!patched.includes('\\bibliography{')) patched = patched.replace('\\end{document}', '\\bibliographystyle{plain}\n\\bibliography{refs}\n\\end{document}');
+  const citeKeys = [...patched.matchAll(/\\cite\{([^}]+)\}/g)].flatMap((match) => match[1].split(',').map((key) => key.trim()));
+  return { source: patched, bibKeys, unresolved: citeKeys.filter((key) => !bibKeys.includes(key)) };
 }
 
-// ---------------------------------------------------------------------------
-// Image-heavy detection
-// ---------------------------------------------------------------------------
-const IMAGE_HEAVY_THRESHOLD = 10;
-function isImageHeavy(doc) { return doc.figures >= IMAGE_HEAVY_THRESHOLD; }
-
-// ---------------------------------------------------------------------------
-// Bounded repair loop (3 attempts max)
-// ---------------------------------------------------------------------------
-const MAX_REPAIRS = 3;
+function compilationFinding(job) {
+  if (job.compile?.ok) return [];
+  return [{
+    severity: 'error', rule: 'compilation',
+    title: job.compile?.timedOut ? 'Compilation timed out' : job.compile?.notFound ? 'Compiler unavailable' : 'Compilation failed',
+    confidence: 1,
+    detail: job.compile?.notFound
+      ? 'The LaTeX source is ready, but this runtime has no compiler. Download the source package or retry in the deployed compiler service.'
+      : 'Review the compiler log or use the source editor and agent proposals for a bounded correction.',
+    approval: false, actions: ['edit-source', 'ask-agent', 'retry-compile'],
+  }];
+}
 
 async function compileWithRepairs(job) {
   let source = job.source;
   let repairsUsed = 0;
-  let compile;
   const repairLog = [];
-
+  let compile;
   for (let attempt = 0; attempt <= MAX_REPAIRS; attempt++) {
     job.stage = attempt === 0 ? 'Compiling' : 'Repairing';
     job.progress = attempt === 0 ? 72 : 72 + attempt * 5;
-    job.repairsUsed = repairsUsed;
     pushJobUpdate(job);
-
     compile = await compileLatex({ source, jobDir: job.dir, target: job.target });
-
-    if (compile.ok) break;
-    if (attempt === MAX_REPAIRS) {
-      job.findings.unshift({
-        severity: 'error', rule: 'repair-budget-exhausted',
-        title: `Compilation failed after ${MAX_REPAIRS} repair attempt(s)`,
-        confidence: 1,
-        detail: 'Automatic repair budget is exhausted. Use the chat below to ask the agent for help or download the LaTeX source for manual review.',
-        approval: false,
-      });
-      break;
-    }
-
-    const { source: repairedSource, repairs } = repairLatex(source, compile.log);
-    if (repairs.length === 0) break;
-    source = repairedSource;
-    repairsUsed += 1;
-    repairLog.push(...repairs);
+    if (compile.ok || compile.notFound) break;
+    if (attempt === MAX_REPAIRS) break;
+    const repaired = repairLatex(source, compile.log);
+    if (!repaired.repairs.length) break;
+    source = repaired.source; repairsUsed += 1; repairLog.push(...repaired.repairs);
   }
-
-  job.source = source;
-  job.compile = compile;
-  job.repairsUsed = repairsUsed;
-  job.repairLog = repairLog;
+  job.source = source; job.sourceHash = sourceHash(source); job.compile = compile;
+  job.repairsUsed = repairsUsed; job.repairLog = [...(job.repairLog ?? []), ...repairLog];
   return compile;
 }
 
-// ---------------------------------------------------------------------------
-// Human approval gate
-// ---------------------------------------------------------------------------
 function needsApproval(findings) {
-  return findings.some((f) => f.approval && f.severity !== 'pass');
+  return findings.some((finding) => finding.approval && finding.severity !== 'pass');
 }
 
 async function waitForApproval(job) {
   return new Promise((resolve) => {
-    job.status = 'awaiting-approval';
-    job.stage = 'Awaiting approval';
-    job.approvalResolve = resolve;
-    pushJobUpdate(job);
+    job.status = 'awaiting-approval'; job.stage = 'Awaiting approval'; job.approvalResolve = resolve; pushJobUpdate(job);
   });
 }
 
-// ---------------------------------------------------------------------------
-// Core job processor
-// ---------------------------------------------------------------------------
+async function writeArtifacts(job) {
+  await writeFile(path.join(job.dir, 'paper.tex'), job.source, 'utf8');
+  await writeFile(path.join(job.dir, 'validation.json'), JSON.stringify({
+    jobId: job.id, sourceRevision: job.sourceRevision, sourceHash: job.sourceHash,
+    findings: job.findings,
+    compile: job.compile ? { ok: job.compile.ok, pdf: job.compile.pdf, timedOut: job.compile.timedOut, notFound: job.compile.notFound } : undefined,
+    reasoning: job.reasoning, repairs: job.repairLog ?? [], assets: job.document?.assetManifest ?? [], audit: job.audit ?? [],
+  }, null, 2));
+  const auditLines = (job.audit ?? []).map((entry) => `- ${entry.timestamp}: ${entry.actor} — ${entry.action}${entry.rationale ? ` (${entry.rationale})` : ''}`);
+  const repairLines = (job.repairLog ?? []).map((repair) => `- Repair [${repair.rule}]: ${repair.description}`);
+  await writeFile(path.join(job.dir, 'change-log.md'), [
+    '# Change log', '', '- Generated editable LaTeX from DOCX structure.',
+    '- Scientific text was not rewritten by automatic repairs.', ...repairLines, ...auditLines,
+    `- ${job.findings.length} validation findings recorded.`, '',
+  ].join('\n'), 'utf8');
+}
+
+async function finishSourceChange(job, { actor, action, rationale }) {
+  job.status = 'running'; job.error = undefined; job.findings = validateLatex(job.source, job.document);
+  await compileWithRepairs(job);
+  job.findings = [...compilationFinding(job), ...validateLatex(job.source, job.document)];
+  job.audit.push({ timestamp: new Date().toISOString(), actor, action, rationale, revision: job.sourceRevision, sourceHash: job.sourceHash });
+  job.reasoning = await askReasoning({ findings: job.findings, document: job.document, jobId: job.id });
+  job.stage = 'Ready'; job.progress = 100; job.status = 'ready';
+  await writeArtifacts(job); pushJobUpdate(job);
+}
+
 async function processJob(job) {
   activeJobCount.value += 1;
   try {
-    // Extract — pass jobDir so images can be saved
-    job.stage = 'Converting'; job.progress = 28;
-    pushJobUpdate(job);
+    job.stage = 'Converting'; job.progress = 28; pushJobUpdate(job);
     job.document = await extractDocx(job.buffer, job.filename, job.dir);
-
-    // Image-heavy consent gate
-    if (isImageHeavy(job.document) && !job.imageHeavyConsent) {
-      job.status = 'awaiting-image-consent';
-      job.stage = 'Awaiting consent';
-      job.findings = [{
-        severity: 'warning', rule: 'image-heavy',
-        title: `${job.document.figures} images detected — consent required`,
-        confidence: 1,
-        detail: 'This document is image-heavy. Extraction will proceed but image assets may require manual verification. Send POST /api/jobs/:id/consent to continue.',
-        approval: true,
-      }];
-      pushJobUpdate(job);
-      activeJobCount.value -= 1;
-      return; // suspended — resumed by /consent
+    if (job.document.figures >= 10 && !job.imageHeavyConsent) {
+      job.status = 'awaiting-image-consent'; job.stage = 'Awaiting consent';
+      job.findings = [{ severity: 'warning', rule: 'image-heavy', title: `${job.document.figures} images detected — consent required`, confidence: 1, detail: 'Review image extraction before continuing.', approval: true, actions: ['consent'] }];
+      pushJobUpdate(job); return;
     }
-
-    // Build LaTeX
-    job.stage = 'Validating'; job.progress = 55;
-    pushJobUpdate(job);
+    job.stage = 'Validating'; job.progress = 55; pushJobUpdate(job);
     job.source = buildLatex(job.document, job.target);
-    job.sourceOriginal = job.source; // snapshot for rollback / diff
-
-    // Bibliography reconciliation
     if (job.bibBuffer) {
       const bibContent = job.bibBuffer.toString('utf8');
-      const { source, bibKeys, unresolved } = reconcileCitations(job.source, bibContent);
-      job.source = source;
-      job.bibKeys = bibKeys;
-      if (unresolved.length > 0) {
-        job.findings.push({
-          severity: 'warning', rule: 'citation-integrity',
-          title: `${unresolved.length} unresolved citation key(s)`,
-          confidence: 0.95,
-          detail: `Keys not found in provided bibliography: ${unresolved.slice(0, 5).join(', ')}${unresolved.length > 5 ? ` … and ${unresolved.length - 5} more` : ''}.`,
-          approval: false,
-        });
-      }
-      job.findings.push({
-        severity: 'pass', rule: 'bibliography-loaded',
-        title: `Bibliography loaded: ${bibKeys.length} key(s)`,
-        confidence: 1,
-        detail: `The provided .bib file was parsed and ${bibKeys.length} citation key(s) were registered.`,
-        approval: false,
-      });
+      const reconciled = reconcileCitations(job.source, bibContent);
+      job.source = reconciled.source; job.bibKeys = reconciled.bibKeys;
       await writeFile(path.join(job.dir, 'refs.bib'), bibContent, 'utf8');
+      if (reconciled.unresolved.length) job.findings.push({ severity: 'warning', rule: 'citation-integrity', title: `${reconciled.unresolved.length} unresolved citation key(s)`, confidence: 0.95, detail: `Missing keys: ${reconciled.unresolved.slice(0, 5).join(', ')}.`, approval: false, actions: ['edit-source'] });
     }
-
+    job.sourceOriginal = job.source; job.sourceRevision = 0; job.sourceHash = sourceHash(job.source);
     job.findings = [...job.findings, ...validateLatex(job.source, job.document)];
-    pushJobUpdate(job);
-
-    // Approval gate before compile
-    if (needsApproval(job.findings)) {
-      await waitForApproval(job);
-      job.status = 'running';
-      pushJobUpdate(job);
-    }
-
-    // Bounded repair loop
+    if (needsApproval(job.findings)) { await waitForApproval(job); job.status = 'running'; }
     await compileWithRepairs(job);
+    if (job.source !== job.sourceOriginal) {
+      job.snapshots.push({ source: job.sourceOriginal, revision: 0, sourceHash: sourceHash(job.sourceOriginal), reason: 'pre-automatic-repair' });
+      job.sourceRevision = 1; job.sourceHash = sourceHash(job.source);
+    }
     await writeFile(path.join(job.dir, 'input.docx'), job.buffer);
-
-    if (!job.compile.ok) {
-      job.findings.unshift({
-        severity: 'error', rule: 'compilation',
-        title: job.compile.timedOut ? 'Compilation timed out' : 'Compilation failed',
-        confidence: 1,
-        detail: 'Review compiler log and generated source. Use the agent chat to ask for help with specific errors.',
-        approval: false,
-      });
-    }
-
-    // Reasoning agent
-    job.stage = 'Reasoning'; job.progress = 88;
-    pushJobUpdate(job);
+    job.buffer = null; job.bibBuffer = null;
+    job.findings = [...compilationFinding(job), ...job.findings];
+    job.stage = 'Reasoning'; job.progress = 88; pushJobUpdate(job);
     job.reasoning = await askReasoning({ findings: job.findings, document: job.document, jobId: job.id });
-
-    // Initialise chat history
-    if (!job.chatHistory) {
-      job.chatHistory = [{
-        role: 'assistant',
-        content: job.reasoning?.summary
-          ? `I've reviewed your document. ${job.reasoning.summary} How can I help you refine the output?`
-          : 'Your document has been converted. How can I help you refine the output?',
-        timestamp: new Date().toISOString(),
-      }];
-    }
-
-    // Finalise
+    if (!job.chatHistory.length) job.chatHistory.push({
+      role: 'assistant', content: `I've reviewed your document. ${job.reasoning.summary} Tell me what formatting you want to change; I will present any executable change for approval.`,
+      provider: job.reasoning.provider, timestamp: new Date().toISOString(),
+    });
     job.stage = 'Ready'; job.progress = 100; job.status = 'ready';
-    await writeFile(path.join(job.dir, 'paper.tex'), job.source, 'utf8');
-    if (job.sourceOriginal && job.sourceOriginal !== job.source) {
-      await writeFile(path.join(job.dir, 'paper.original.tex'), job.sourceOriginal, 'utf8');
+    await writeArtifacts(job); pushJobUpdate(job);
+    const subscribers = sseSubscribers.get(job.id);
+    if (subscribers) {
+      for (const response of subscribers) { try { response.write('event: done\ndata: {}\n\n'); response.end(); } catch { /* ignore */ } }
+      sseSubscribers.delete(job.id);
     }
-    await writeFile(path.join(job.dir, 'validation.json'), JSON.stringify({
-      jobId: job.id, findings: job.findings, compile: job.compile,
-      reasoning: job.reasoning, repairs: job.repairLog ?? [],
-    }, null, 2));
-    await writeFile(path.join(job.dir, 'change-log.md'),
-      `# Change log\n\n` +
-      `- Generated editable LaTeX from DOCX structure.\n` +
-      `- Applied no semantic rewrites.\n` +
-      (job.repairLog?.length ? job.repairLog.map((r) => `- Repair [${r.rule}]: ${r.description}`).join('\n') + '\n' : '') +
-      `- ${job.findings.length} validation findings recorded.\n`
-    );
-    pushJobUpdate(job);
-    // Close SSE subscribers after job completes
-    const subs = sseSubscribers.get(job.id);
-    if (subs) { for (const res of subs) { try { res.write('event: done\ndata: {}\n\n'); res.end(); } catch { /* ignore */ } } sseSubscribers.delete(job.id); }
   } catch (error) {
-    job.status = 'error'; job.stage = 'Escalated';
-    job.error = error.message; job.progress = 100;
-    // Still init chat history so user can ask about the error
-    if (!job.chatHistory) {
-      job.chatHistory = [{
-        role: 'assistant',
-        content: `An error occurred during conversion: ${error.message}. I can help you understand what went wrong or suggest next steps.`,
-        timestamp: new Date().toISOString(),
-      }];
-    }
+    job.status = 'error'; job.stage = 'Escalated'; job.progress = 100;
+    job.error = error instanceof RequestError ? error.message : 'Conversion failed. Use the manual recovery tools or try another document.';
+    if (!job.chatHistory.length) job.chatHistory.push({ role: 'assistant', content: job.error, provider: 'rule-based', timestamp: new Date().toISOString() });
+    if (job.source) await writeArtifacts(job).catch(() => {});
     pushJobUpdate(job);
-    const subs = sseSubscribers.get(job.id);
-    if (subs) { for (const res of subs) { try { res.write(`event: error\ndata: ${JSON.stringify({ error: error.message })}\n\n`); res.end(); } catch { /* ignore */ } } sseSubscribers.delete(job.id); }
   } finally {
     activeJobCount.value = Math.max(0, activeJobCount.value - 1);
   }
 }
 
-// ---------------------------------------------------------------------------
-// Retention cleanup worker (24-hour)
-// ---------------------------------------------------------------------------
-const RETENTION_MS = 24 * 60 * 60 * 1000;
+async function readOptional(filename) {
+  try { return await readFile(filename); } catch { return null; }
+}
+
+async function sourceZip(job) {
+  const entries = [];
+  for (const filename of ['paper.tex', 'refs.bib', 'validation.json', 'change-log.md', 'paper.pdf']) {
+    const data = await readOptional(path.join(job.dir, filename));
+    if (data) entries.push({ name: filename, data });
+  }
+  for (const asset of job.document?.assetManifest ?? []) {
+    const data = await readOptional(path.join(job.dir, safeName(asset.filename)));
+    if (data) entries.push({ name: `assets/${safeName(asset.filename)}`, data });
+  }
+  return createZip(entries);
+}
 
 async function runRetentionCleanup() {
   try {
-    const entries = await readdir(jobsRoot);
     const now = Date.now();
-    for (const entry of entries) {
-      const dirPath = path.join(jobsRoot, entry);
+    for (const entry of await readdir(jobsRoot)) {
+      const directory = path.join(jobsRoot, entry);
       try {
-        const info = await stat(dirPath);
+        const info = await stat(directory);
         if (info.isDirectory() && now - info.mtimeMs > RETENTION_MS) {
-          await rm(dirPath, { recursive: true, force: true });
-          jobs.delete(entry);
+          await rm(directory, { recursive: true, force: true }); jobs.delete(entry);
         }
-      } catch { /* skip */ }
+      } catch { /* skip individual entries */ }
     }
-  } catch { /* non-fatal */ }
+  } catch { /* cleanup is best effort */ }
 }
 
 runRetentionCleanup();
-setInterval(runRetentionCleanup, 6 * 60 * 60 * 1000);
+setInterval(runRetentionCleanup, 6 * 60 * 60 * 1000).unref();
 
-// ---------------------------------------------------------------------------
-// HTTP server
-// ---------------------------------------------------------------------------
 const server = http.createServer(async (req, res) => {
-  // Security headers for all responses
   res.setHeader('x-frame-options', 'DENY');
   res.setHeader('x-content-type-options', 'nosniff');
-
+  res.setHeader('referrer-policy', 'no-referrer');
+  const url = new URL(req.url, 'http://paperforge.local');
+  const pathname = url.pathname;
   try {
-    // Health
-    if (req.method === 'GET' && req.url === '/api/health') {
-      return json(res, 200, {
-        ok: true, service: 'paperforge', version: '0.3.0',
-        jobs: jobs.size, activeJobs: activeJobCount.value,
-        uptime: process.uptime(),
-        gemini: Boolean(process.env.GEMINI_API_KEY),
-      });
+    if (req.method === 'GET' && pathname === '/api/health') {
+      const commit = process.env.RAILWAY_GIT_COMMIT_SHA || process.env.GIT_COMMIT_SHA || '';
+      return json(res, 200, { ok: true, service: 'paperforge', version: '0.4.0', revision: commit ? commit.slice(0, 12) : 'local', uptime: Math.floor(process.uptime()) });
     }
-
-    // GET /api/jobs — list all jobs (lightweight)
-    if (req.method === 'GET' && req.url === '/api/jobs') {
-      const list = [...jobs.values()].map(publicJob);
-      return json(res, 200, list);
+    if (pathname === '/api/jobs' && req.method === 'GET') {
+      const sessionId = sessionFor(req, res, false);
+      if (!sessionId) return json(res, 401, { error: 'A PaperForge session is required.' });
+      return json(res, 200, [...jobs.values()].filter((job) => job.ownerSessionId === sessionId).map(publicJob));
     }
-
-    // POST /api/jobs — create job
-    if (req.method === 'POST' && req.url === '/api/jobs') {
-      if (activeJobCount.value >= MAX_CONCURRENT_JOBS) {
-        return json(res, 429, { error: `Server is at capacity (${MAX_CONCURRENT_JOBS} active jobs). Please retry shortly.` });
-      }
+    if (pathname === '/api/jobs' && req.method === 'POST') {
+      const sessionId = sessionFor(req, res, true);
+      if (!rateLimit(`create:${sessionId}`, 10, 60 * 60 * 1000)) return json(res, 429, { error: 'Job creation limit reached. Try again later.' });
+      if (activeJobCount.value >= MAX_CONCURRENT_JOBS) return json(res, 429, { error: 'Server is at capacity. Please retry shortly.' });
       const { fields, file, bibFile } = await parseUpload(req);
       validateUpload(file);
-      const id = `PF-${randomUUID().slice(0, 8).toUpperCase()}`;
+      const id = `PF-${randomUUID().toUpperCase()}`;
       const dir = path.join(jobsRoot, id);
       await mkdir(dir, { recursive: true });
+      const now = new Date().toISOString();
       const job = {
-        id, filename: file.filename, size: file.size,
+        id, ownerSessionId: sessionId, filename: file.filename, size: file.size,
         target: TEMPLATE_IDS.includes(fields.target) ? fields.target : 'IEEEtran',
-        status: 'running', stage: 'Thinking', progress: 8,
-        dir, buffer: file.buffer,
-        bibBuffer: bibFile?.buffer ?? null,
-        imageHeavyConsent: fields.imageHeavyConsent === 'true',
-        createdAt: new Date().toISOString(),
-        findings: [], repairsUsed: 0, repairLog: [],
-        sourceOriginal: null,
-        chatHistory: [],
+        status: 'running', stage: 'Thinking', progress: 8, dir,
+        buffer: file.buffer, bibBuffer: bibFile?.buffer ?? null,
+        imageHeavyConsent: fields.imageHeavyConsent === 'true', createdAt: now, updatedAt: now,
+        findings: [], repairsUsed: 0, repairLog: [], chatHistory: [], proposals: [], audit: [], snapshots: [],
+        sourceOriginal: null, sourceRevision: 0, sourceHash: null,
       };
-      jobs.set(id, job);
-      processJob(job); // fire-and-forget
-      return json(res, 202, publicJob(job));
+      jobs.set(id, job); processJob(job);
+      return json(res, 202, { job: publicJob(job) });
     }
 
-    // GET /api/jobs/:id/events — SSE stream for real-time progress
-    const matchEvents = req.url.match(/^\/api\/jobs\/([^/]+)\/events$/);
-    if (req.method === 'GET' && matchEvents) {
-      const job = jobs.get(matchEvents[1]);
-      if (!job) return json(res, 404, { error: 'Job not found.' });
-      res.writeHead(200, {
-        'content-type': 'text/event-stream',
-        'cache-control': 'no-cache',
-        'connection': 'keep-alive',
-        'x-accel-buffering': 'no',
-      });
-      res.write(`event: job\ndata: ${JSON.stringify(publicJob(job))}\n\n`);
-      if (!sseSubscribers.has(job.id)) sseSubscribers.set(job.id, new Set());
-      sseSubscribers.get(job.id).add(res);
-      req.on('close', () => { const subs = sseSubscribers.get(job.id); if (subs) subs.delete(res); });
-      return; // keep-alive; don't end
-    }
-
-    // GET /api/jobs/:id/diff — before/after LaTeX diff
-    const matchDiff = req.url.match(/^\/api\/jobs\/([^/]+)\/diff$/);
-    if (req.method === 'GET' && matchDiff) {
-      const job = jobs.get(matchDiff[1]);
-      if (!job) return json(res, 404, { error: 'Job not found.' });
-      if (!job.source) return json(res, 409, { error: 'LaTeX source not yet generated.' });
-      const original = job.sourceOriginal ?? job.source;
-      const current = job.source;
-      return json(res, 200, {
-        jobId: job.id, original,
-        repaired: original !== current ? current : null,
-        hasChanges: original !== current,
-        repairs: job.repairLog ?? [],
-      });
-    }
-
-    // GET /api/jobs/:id/chat — get chat history
-    const matchChatGet = req.url.match(/^\/api\/jobs\/([^/]+)\/chat$/);
-    if (req.method === 'GET' && matchChatGet) {
-      const job = jobs.get(matchChatGet[1]);
-      if (!job) return json(res, 404, { error: 'Job not found.' });
-      return json(res, 200, { jobId: job.id, history: job.chatHistory ?? [] });
-    }
-
-    // POST /api/jobs/:id/chat — send a chat message
-    const matchChatPost = req.url.match(/^\/api\/jobs\/([^/]+)\/chat$/);
-    if (req.method === 'POST' && matchChatPost) {
-      const job = jobs.get(matchChatPost[1]);
-      if (!job) return json(res, 404, { error: 'Job not found.' });
-
-      let body;
-      try { body = await parseJsonBody(req); } catch { return json(res, 400, { error: 'Invalid JSON body.' }); }
-
-      const userMessage = String(body.message ?? '').trim();
-      if (!userMessage) return json(res, 400, { error: 'message is required.' });
-
-      if (!job.chatHistory) job.chatHistory = [];
-
-      // Add user message to history
-      const userEntry = { role: 'user', content: userMessage, timestamp: new Date().toISOString() };
-      job.chatHistory.push(userEntry);
-
-      // Build messages array for AI (last N turns to keep context bounded)
-      const contextMessages = job.chatHistory.slice(-20).map((m) => ({
-        role: m.role,
-        content: m.content,
-      }));
-
-      // Call agent
-      const agentResponse = await chatWithAgent({
-        jobId: job.id,
-        messages: contextMessages,
-        job,
-      });
-
-      const assistantEntry = {
-        role: 'assistant',
-        content: agentResponse.message ?? agentResponse.summary ?? JSON.stringify(agentResponse),
-        action: agentResponse.action,
-        patch: agentResponse.patch,
-        timestamp: new Date().toISOString(),
-      };
-      job.chatHistory.push(assistantEntry);
-
-      // If agent suggested a patch, emit SSE update
-      pushJobUpdate(job);
-
-      return json(res, 200, { userEntry, assistantEntry, history: job.chatHistory });
-    }
-
-    // GET /api/jobs/:id[/output/:type]
-    const matchJob = req.url.match(/^\/api\/jobs\/([^/]+)(?:\/output\/([^/]+))?$/);
-    if (req.method === 'GET' && matchJob) {
-      const job = jobs.get(matchJob[1]);
-      if (!job) return json(res, 404, { error: 'Job not found.' });
-      if (!matchJob[2]) return json(res, 200, publicJob(job));
-      const allowed = { source: 'paper.tex', report: 'validation.json', changelog: 'change-log.md', pdf: 'paper.pdf' };
-      const filename = allowed[matchJob[2]];
-      if (!filename) return json(res, 404, { error: 'Output not found.' });
-      const content = await readFile(path.join(job.dir, filename));
-      res.writeHead(200, {
-        'content-type': filename.endsWith('.pdf') ? 'application/pdf' : 'text/plain; charset=utf-8',
-        'content-disposition': `attachment; filename="${filename}"`,
-      });
-      return res.end(content);
-    }
-
-    // POST /api/jobs/:id/approve — resume after approval gate
-    const matchApprove = req.url.match(/^\/api\/jobs\/([^/]+)\/approve$/);
-    if (req.method === 'POST' && matchApprove) {
-      const job = jobs.get(matchApprove[1]);
-      if (!job) return json(res, 404, { error: 'Job not found.' });
-      if (job.status !== 'awaiting-approval') return json(res, 409, { error: 'Job is not awaiting approval.' });
-      if (typeof job.approvalResolve === 'function') { job.approvalResolve(); delete job.approvalResolve; }
-      return json(res, 200, { ok: true, message: 'Approval recorded. Conversion resuming.' });
-    }
-
-    // POST /api/jobs/:id/consent — resume after image-heavy consent
-    const matchConsent = req.url.match(/^\/api\/jobs\/([^/]+)\/consent$/);
-    if (req.method === 'POST' && matchConsent) {
-      const job = jobs.get(matchConsent[1]);
-      if (!job) return json(res, 404, { error: 'Job not found.' });
-      if (job.status !== 'awaiting-image-consent') return json(res, 409, { error: 'Job is not awaiting image consent.' });
-      job.imageHeavyConsent = true;
-      job.status = 'running';
-      processJob(job); // resume
-      return json(res, 200, { ok: true, message: 'Consent recorded. Extraction resuming.' });
-    }
-
-    // POST /api/jobs/:id/rollback — restore original LaTeX before repairs
-    const matchRollback = req.url.match(/^\/api\/jobs\/([^/]+)\/rollback$/);
-    if (req.method === 'POST' && matchRollback) {
-      const job = jobs.get(matchRollback[1]);
-      if (!job) return json(res, 404, { error: 'Job not found.' });
-      if (!['ready', 'error'].includes(job.status)) return json(res, 409, { error: 'Job must be completed before rollback.' });
-      if (!job.sourceOriginal || job.sourceOriginal === job.source) return json(res, 409, { error: 'No repairs to roll back.' });
-      job.source = job.sourceOriginal;
-      job.repairLog = [];
-      job.repairsUsed = 0;
-      await writeFile(path.join(job.dir, 'paper.tex'), job.source, 'utf8');
-      job.status = 'rolled-back';
-      job.stage = 'Rolled back';
-      pushJobUpdate(job);
-      return json(res, 200, { ok: true, message: 'Source rolled back to pre-repair state. Download the updated LaTeX source.' });
-    }
-
-    // DELETE /api/jobs/:id — cancel/delete job
-    const matchDelete = req.url.match(/^\/api\/jobs\/([^/]+)$/);
-    if (req.method === 'DELETE' && matchDelete) {
-      const job = jobs.get(matchDelete[1]);
-      if (!job) return json(res, 404, { error: 'Job not found.' });
-      if (typeof job.approvalResolve === 'function') { job.approvalResolve(); delete job.approvalResolve; }
-      job.status = 'cancelled'; job.stage = 'Cancelled'; job.progress = 0;
-      pushJobUpdate(job);
-      jobs.delete(job.id);
-      rm(job.dir, { recursive: true, force: true }).catch(() => {});
-      const subs = sseSubscribers.get(job.id);
-      if (subs) { for (const r of subs) { try { r.write('event: cancelled\ndata: {}\n\n'); r.end(); } catch { /* ignore */ } } sseSubscribers.delete(job.id); }
-      return json(res, 200, { ok: true, message: 'Job cancelled and artifacts deleted.' });
-    }
-
-    // Static file serving
-    if (req.method === 'GET') {
-      const requested = req.url === '/' ? '/index.html' : req.url.split('?')[0];
-      const file = path.resolve(root, `.${requested}`);
-      if (!file.startsWith(root) || file.includes('node_modules') || file.includes('.codex-local')) {
-        return res.writeHead(403).end();
+    const match = pathname.match(/^\/api\/jobs\/([^/]+)(?:\/(.*))?$/);
+    if (match) {
+      const job = ownedJob(req, res, match[1]);
+      if (!job) return;
+      const suffix = match[2] ?? '';
+      if (req.method === 'GET' && !suffix) return json(res, 200, publicJob(job));
+      if (req.method === 'GET' && suffix === 'events') {
+        res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', 'x-accel-buffering': 'no' });
+        res.write(`event: job\ndata: ${JSON.stringify(publicJob(job))}\n\n`);
+        if (['ready', 'error', 'rolled-back', 'cancelled'].includes(job.status)) { res.write('event: done\ndata: {}\n\n'); return res.end(); }
+        if (!sseSubscribers.has(job.id)) sseSubscribers.set(job.id, new Set());
+        sseSubscribers.get(job.id).add(res); req.on('close', () => sseSubscribers.get(job.id)?.delete(res)); return;
       }
-      let content;
-      try { content = await readFile(file); } catch { return res.writeHead(404).end(); }
-      const type = file.endsWith('.css') ? 'text/css'
-        : file.endsWith('.js') || file.endsWith('.mjs') ? 'text/javascript'
-        : 'text/html';
+      if (req.method === 'GET' && suffix === 'diff') return json(res, 200, {
+        jobId: job.id, original: job.sourceOriginal ?? job.source,
+        repaired: job.sourceOriginal !== job.source ? job.source : null,
+        hasChanges: job.sourceOriginal !== job.source, repairs: job.repairLog ?? [],
+        sourceRevision: job.sourceRevision, sourceHash: job.sourceHash,
+      });
+      if (req.method === 'GET' && suffix === 'source') {
+        if (!job.source) return json(res, 409, { error: 'Source is not ready.' });
+        return json(res, 200, { source: job.source, revision: job.sourceRevision, sourceHash: job.sourceHash });
+      }
+      if (req.method === 'PUT' && suffix === 'source') {
+        if (!['ready', 'error', 'rolled-back'].includes(job.status)) return json(res, 409, { error: 'Wait for conversion to finish before editing.' });
+        const body = await parseJsonBody(req, SOURCE_LIMIT);
+        const nextSource = String(body.source ?? '');
+        if (Number(body.baseRevision) !== job.sourceRevision || (body.sourceHash && body.sourceHash !== job.sourceHash)) return json(res, 409, { error: 'Source revision conflict. Reload the latest source before saving.' });
+        if (!nextSource.includes('\\begin{document}') || !nextSource.includes('\\end{document}')) return json(res, 422, { error: 'Source must contain a complete document environment.' });
+        job.snapshots.push({ source: job.source, revision: job.sourceRevision, sourceHash: job.sourceHash, reason: 'before-manual-edit' });
+        job.source = nextSource; job.sourceRevision += 1; job.sourceHash = sourceHash(nextSource);
+        await finishSourceChange(job, { actor: 'user', action: 'manual-source-edit', rationale: String(body.rationale ?? 'Manual source edit').slice(0, 500) });
+        return json(res, 200, { ok: true, job: publicJob(job) });
+      }
+      if (req.method === 'GET' && suffix === 'chat') return json(res, 200, { jobId: job.id, history: job.chatHistory, proposals: job.proposals.map(publicProposal) });
+      if (req.method === 'POST' && suffix === 'chat') {
+        const sessionId = sessionFor(req, res, false);
+        if (!rateLimit(`chat:${sessionId}`, 30, 10 * 60 * 1000)) return json(res, 429, { error: 'Chat rate limit reached. Try again shortly.' });
+        const body = await parseJsonBody(req);
+        const message = String(body.message ?? '').trim();
+        if (!message || message.length > 4_000) return json(res, 400, { error: 'message must contain 1–4000 characters.' });
+        const userEntry = { role: 'user', content: message, timestamp: new Date().toISOString() };
+        job.chatHistory.push(userEntry);
+        const agentResponse = await chatWithAgent({
+          jobId: job.id,
+          messages: job.chatHistory.slice(-16).map(({ role, content }) => ({ role, content: String(content).slice(0, 4_000) })),
+          job: {
+            target: job.target, sourceRevision: job.sourceRevision, sourceHash: job.sourceHash,
+            findings: job.findings.slice(0, 20),
+            document: {
+              authorInfo: job.document?.authorInfo,
+              tables: job.document?.tables?.map((table, index) => ({ index: index + 1, caption: table.caption, rows: table.rows?.length, complex: table.complex })),
+              assets: job.document?.assetManifest,
+            },
+            sourceExcerpt: String(job.source ?? '').slice(0, 20_000),
+          },
+        });
+        let proposal;
+        if (agentResponse.proposal) {
+          try {
+            proposal = validateAgentProposal({ ...agentResponse.proposal, id: `proposal-${randomUUID()}`, baseRevision: job.sourceRevision });
+            proposal.createdAt = new Date().toISOString(); job.proposals.push(proposal);
+          } catch { proposal = undefined; }
+        }
+        const assistantEntry = {
+          role: 'assistant', content: String(agentResponse.message ?? 'I could not create a safe executable proposal. You can use the source editor for a manual change.'),
+          provider: agentResponse.provider ?? 'rule-based', fallback: Boolean(agentResponse.fallback),
+          proposalId: proposal?.id, timestamp: new Date().toISOString(),
+        };
+        job.chatHistory.push(assistantEntry); pushJobUpdate(job);
+        return json(res, 200, { userEntry, assistantEntry, history: job.chatHistory, proposal: publicProposal(proposal) });
+      }
+      const proposalMatch = suffix.match(/^proposals\/([^/]+)\/(apply|reject)$/);
+      if (req.method === 'POST' && proposalMatch) {
+        const proposal = job.proposals.find((item) => item.id === proposalMatch[1]);
+        if (!proposal) return json(res, 404, { error: 'Proposal not found.' });
+        if (proposal.status !== 'pending') return json(res, 409, { error: `Proposal is already ${proposal.status}.` });
+        const body = await parseJsonBody(req);
+        if (proposalMatch[2] === 'reject') {
+          Object.assign(proposal, rejectAgentProposal({ proposal, revision: job.sourceRevision }).proposal);
+          job.audit.push({ timestamp: new Date().toISOString(), actor: 'user', action: 'reject-proposal', proposalId: proposal.id, revision: job.sourceRevision });
+          pushJobUpdate(job); return json(res, 200, { ok: true, proposal: publicProposal(proposal), job: publicJob(job) });
+        }
+        if (proposal.approvalRequired && body.confirm !== true) return json(res, 422, { error: 'This proposal requires explicit confirmation.' });
+        job.snapshots.push({ source: job.source, revision: job.sourceRevision, sourceHash: job.sourceHash, reason: `before-${proposal.id}` });
+        let applied;
+        try {
+          applied = applyAgentProposal({ source: job.source, revision: job.sourceRevision, expectedRevision: Number(body.expectedRevision ?? proposal.baseRevision), proposal });
+        } catch (error) {
+          job.snapshots.pop(); return json(res, 409, { error: error.message });
+        }
+        job.source = applied.source; job.sourceRevision = applied.revision; job.sourceHash = sourceHash(job.source);
+        Object.assign(proposal, applied.proposal);
+        await finishSourceChange(job, { actor: 'agent-with-user-approval', action: 'apply-proposal', rationale: proposal.rationale });
+        return json(res, 200, { ok: true, proposal: publicProposal(proposal), job: publicJob(job) });
+      }
+      const outputMatch = suffix.match(/^output\/(source|source-zip|report|changelog|pdf)$/);
+      if (req.method === 'GET' && outputMatch) {
+        const type = outputMatch[1];
+        if (type === 'source-zip') {
+          if (!job.source || !['ready', 'error', 'rolled-back'].includes(job.status)) return json(res, 409, { error: 'Source package is not ready.' });
+          const archive = await sourceZip(job);
+          res.writeHead(200, { 'content-type': 'application/zip', 'content-disposition': `attachment; filename="paperforge-${job.id}.zip"`, 'content-length': archive.length, 'cache-control': 'no-store' });
+          return res.end(archive);
+        }
+        const files = { source: 'paper.tex', report: 'validation.json', changelog: 'change-log.md', pdf: 'paper.pdf' };
+        const filename = files[type];
+        const content = await readOptional(path.join(job.dir, filename));
+        if (!content) return json(res, 404, { error: 'Output is not available.' });
+        res.writeHead(200, { 'content-type': type === 'pdf' ? 'application/pdf' : 'text/plain; charset=utf-8', 'content-disposition': `attachment; filename="${filename}"`, 'cache-control': 'no-store' });
+        return res.end(content);
+      }
+      if (req.method === 'POST' && suffix === 'approve') {
+        if (job.status !== 'awaiting-approval') return json(res, 409, { error: 'Job is not awaiting approval.' });
+        if (typeof job.approvalResolve === 'function') { job.approvalResolve(); delete job.approvalResolve; }
+        return json(res, 200, { ok: true, message: 'Approval recorded.' });
+      }
+      if (req.method === 'POST' && suffix === 'consent') {
+        if (job.status !== 'awaiting-image-consent') return json(res, 409, { error: 'Job is not awaiting image consent.' });
+        job.imageHeavyConsent = true; job.status = 'running'; processJob(job);
+        return json(res, 200, { ok: true, message: 'Consent recorded.' });
+      }
+      if (req.method === 'POST' && suffix === 'rollback') {
+        const snapshot = job.snapshots.pop();
+        if (!snapshot) return json(res, 409, { error: 'No earlier source revision is available.' });
+        job.source = snapshot.source; job.sourceRevision += 1; job.sourceHash = sourceHash(job.source);
+        await finishSourceChange(job, { actor: 'user', action: 'rollback', rationale: snapshot.reason });
+        job.status = 'rolled-back'; job.stage = 'Rolled back'; pushJobUpdate(job);
+        return json(res, 200, { ok: true, message: 'Previous source revision restored.', job: publicJob(job) });
+      }
+      if (req.method === 'DELETE' && !suffix) {
+        if (typeof job.approvalResolve === 'function') { job.approvalResolve(); delete job.approvalResolve; }
+        job.status = 'cancelled'; pushJobUpdate(job); jobs.delete(job.id);
+        await rm(job.dir, { recursive: true, force: true });
+        const subscribers = sseSubscribers.get(job.id);
+        if (subscribers) { for (const response of subscribers) { try { response.end(); } catch { /* ignore */ } } }
+        sseSubscribers.delete(job.id);
+        return json(res, 200, { ok: true, message: 'Job and artifacts deleted.' });
+      }
+      return json(res, 405, { error: 'Method not allowed.' });
+    }
+    if (req.method === 'GET') {
+      const staticFiles = new Map([
+        ['/', 'index.html'], ['/index.html', 'index.html'], ['/styles.css', 'styles.css'],
+        ['/src/app.js', 'src/app.js'], ['/src/state.js', 'src/state.js'],
+      ]);
+      const relative = staticFiles.get(pathname);
+      if (!relative) return res.writeHead(404).end();
+      const file = path.join(root, relative);
+      const content = await readFile(file);
+      const type = file.endsWith('.css') ? 'text/css' : file.endsWith('.js') ? 'text/javascript' : 'text/html';
       res.writeHead(200, {
         'content-type': `${type}; charset=utf-8`,
         'content-security-policy': "default-src 'self'; connect-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
@@ -592,10 +562,10 @@ const server = http.createServer(async (req, res) => {
       });
       return res.end(content);
     }
-
     return json(res, 405, { error: 'Method not allowed.' });
   } catch (error) {
-    return json(res, 400, { error: error.message || 'Request failed.' });
+    const status = error instanceof RequestError ? error.status : 400;
+    return json(res, status, { error: error instanceof RequestError ? error.message : 'Request failed.' });
   }
 });
 
