@@ -15,16 +15,25 @@ const icons = {
   cancel:   '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>',
   diff:     '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h8M4 18h12"/></svg>',
   bib:      '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v4H4zM4 12h10M4 16h7"/></svg>',
+  chat:     '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
+  send:     '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M22 2 11 13M22 2 15 22l-4-9-9-4 20-7z"/></svg>',
+  user:     '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z"/></svg>',
+  bot:      '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M12 11V7M8 7h8M9 15h.01M15 15h.01"/></svg>',
+  close:    '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>',
+  wrench:   '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>',
 };
 
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
-let job = null;          // current active job
+let job = null;
 let findingFilter = 'all';
-let diffData = null;     // { original, repaired, repairs }
+let diffData = null;
 let showDiff = false;
-let sseController = null; // AbortController for SSE stream
+let showChat = false;
+let sseController = null;
+let chatHistory = [];
+let chatLoading = false;
 
 // ---------------------------------------------------------------------------
 // Utility: normalise server job into local shape
@@ -40,6 +49,7 @@ function normalizeServerJob(serverJob) {
     figures: serverJob.document?.figures ?? 0,
     tables: serverJob.document?.tables ?? 0,
     references: serverJob.document?.references ?? 0,
+    authorInfo: serverJob.document?.authorInfo ?? null,
     findings: serverJob.findings ?? [],
     outputs: {
       source: Boolean(serverJob.document),
@@ -69,15 +79,12 @@ function connectSSE(id) {
   es.addEventListener('done', () => { es.close(); sseController = null; });
   es.addEventListener('cancelled', () => { es.close(); sseController = null; job = null; render(); });
   es.addEventListener('error', () => {
-    // SSE error (server closed or network issue)
     if (job && !['ready', 'error', 'rolled-back', 'cancelled'].includes(job.status)) {
-      // Fall back to polling once
       window.setTimeout(() => watchServerJobOnce(id), 2000);
     }
     es.close();
   });
 
-  // Abort if caller calls abort()
   sseController.signal.addEventListener('abort', () => es.close());
 }
 
@@ -196,8 +203,74 @@ function renderDiffPanel() {
     </section>`;
 }
 
+// ---------------------------------------------------------------------------
+// Chat panel
+// ---------------------------------------------------------------------------
+function renderChatPanel() {
+  if (!showChat) return '';
+
+  const messages = chatHistory.map((msg) => {
+    const isUser = msg.role === 'user';
+    const icon = isUser ? icons.user : icons.bot;
+    const cls = isUser ? 'chat-msg user' : 'chat-msg assistant';
+    const timestamp = msg.timestamp
+      ? new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      : '';
+    return `<div class="${cls}">
+      <span class="chat-avatar">${icon}</span>
+      <div class="chat-bubble">
+        <p>${escHtml(msg.content)}</p>
+        ${timestamp ? `<span class="chat-time">${timestamp}</span>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+
+  const loadingMsg = chatLoading
+    ? `<div class="chat-msg assistant chat-loading">
+        <span class="chat-avatar">${icons.bot}</span>
+        <div class="chat-bubble"><span class="chat-dots"><span></span><span></span><span></span></span></div>
+      </div>`
+    : '';
+
+  return `
+    <section class="chat-panel" aria-labelledby="chat-title">
+      <div class="chat-header">
+        <div class="chat-title-row">
+          <span class="chat-icon">${icons.chat}</span>
+          <div>
+            <h2 id="chat-title">Agent assistant</h2>
+            <p class="chat-subtitle">Ask about findings, request fixes, or get help with the LaTeX output</p>
+          </div>
+        </div>
+        <button class="icon-button chat-close-btn" type="button" id="chat-close-button" aria-label="Close chat">${icons.close}</button>
+      </div>
+      <div class="chat-messages" id="chat-messages" aria-live="polite" aria-label="Conversation">
+        ${messages || '<div class="chat-empty"><p>Ask me anything about your converted document — findings, formatting, LaTeX syntax, or how to fix specific issues.</p></div>'}
+        ${loadingMsg}
+      </div>
+      <div class="chat-input-row">
+        <textarea
+          id="chat-input"
+          class="chat-textarea"
+          placeholder="Ask the agent… e.g. 'Why is Table 2 misaligned?' or 'Fix the author block'"
+          rows="2"
+          aria-label="Chat message"
+        ></textarea>
+        <button class="chat-send-btn" type="button" id="chat-send-button" aria-label="Send message" ${chatLoading ? 'disabled' : ''}>
+          ${icons.send}
+        </button>
+      </div>
+      <div class="chat-quick-actions">
+        <button class="chat-quick-btn" type="button" data-quick="Explain the validation findings">Explain findings</button>
+        <button class="chat-quick-btn" type="button" data-quick="How do I fix the author and institution block?">Fix author block</button>
+        <button class="chat-quick-btn" type="button" data-quick="Why are my tables not rendering correctly?">Table issues</button>
+        <button class="chat-quick-btn" type="button" data-quick="How do I add my images to the LaTeX source?">Image help</button>
+      </div>
+    </section>`;
+}
+
 function escHtml(s) {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +314,11 @@ function render() {
   const showRollback = isTerminal && job.real && (job.repairsUsed > 0) && job.status !== 'rolled-back';
   const hasDiffAvailable = job.real && (job.repairsUsed > 0 || (diffData && diffData.hasChanges));
 
+  // Author info summary
+  const authorSummary = job.authorInfo?.authors?.length > 0
+    ? `<div class="author-chip">${icons.user} ${escHtml(job.authorInfo.authors.slice(0, 2).join(', '))}${job.authorInfo.authors.length > 2 ? ` +${job.authorInfo.authors.length - 2}` : ''}</div>`
+    : '';
+
   appRoot.innerHTML = `
     <aside class="sidebar" aria-label="Primary navigation">
       <div class="brand"><span class="brand-mark">P</span><span>PaperForge</span></div>
@@ -251,6 +329,7 @@ function render() {
       </nav>
       <div class="sidebar-bottom">
         <div class="storage-note"><span class="storage-line"></span><div><strong>Privacy mode</strong><span>Deletes after 24 h</span></div></div>
+        <button class="nav-item ${showChat ? 'active' : ''}" type="button" id="nav-chat" data-nav="chat"><span class="nav-icon">${icons.chat}</span>Agent chat${chatHistory.length > 0 ? ` <span class="chat-badge">${chatHistory.length}</span>` : ''}</button>
         <button class="nav-item" type="button" id="nav-settings" data-nav="settings"><span class="nav-icon">${icons.info}</span>Settings</button>
       </div>
     </aside>
@@ -259,16 +338,20 @@ function render() {
         <div class="crumbs"><span>Workspace</span><span class="crumb-rule"></span><strong>${job.filename}</strong></div>
         <div class="top-actions">
           <span class="secure-label">${icons.check} Local session</span>
+          <button class="topbar-chat-btn ${showChat ? 'active' : ''}" type="button" id="topbar-chat-toggle" aria-label="Toggle agent chat">
+            ${icons.chat} Ask agent ${chatHistory.length > 0 ? `<span class="chat-badge">${chatHistory.filter(m => m.role === 'assistant').length}</span>` : ''}
+          </button>
           ${job.real && !isTerminal ? `<button class="icon-button" type="button" id="cancel-button" aria-label="Cancel job" title="Cancel this job">${icons.cancel}</button>` : ''}
         </div>
       </header>
-      <div class="workbench">
+      <div class="workbench ${showChat ? 'chat-open' : ''}">
         <section class="workspace-column" aria-labelledby="page-title">
           ${gateBanner}
           <div class="page-heading">
             <div>
               <h1 id="page-title">Conversion workspace</h1>
               <p>Keep your science intact. Shape the format with a clear audit trail.</p>
+              ${authorSummary}
             </div>
             ${badge(statusLabel, statusTone)}
           </div>
@@ -308,6 +391,7 @@ function render() {
               <button class="text-button" id="reset-button" type="button">Start over</button>
               ${showRollback ? `<button class="text-button rollback-button" id="rollback-button" type="button">${icons.rollback} Roll back repairs</button>` : ''}
               ${hasDiffAvailable ? `<button class="text-button" id="diff-button" type="button">${icons.diff} ${showDiff ? 'Hide diff' : 'View diff'}</button>` : ''}
+              ${isTerminal ? `<button class="text-button chat-open-btn" id="open-chat-inline" type="button">${icons.chat} Ask agent to fix</button>` : ''}
             </div>
           </section>
 
@@ -336,6 +420,8 @@ function render() {
             </div>
             <div class="findings-list">${findings.map(renderFinding).join('')}</div>
           </section>
+
+          ${renderChatPanel()}
         </section>
 
         <aside class="detail-rail" aria-label="Job details">
@@ -345,6 +431,14 @@ function render() {
             <strong>${job.stage === 'Ready' ? 'Ready for review' : job.stage}</strong>
             <span class="rail-muted">Updated just now</span>
           </div>
+          ${job.authorInfo?.authors?.length > 0 ? `
+          <div class="rail-block">
+            <span class="rail-label">Extracted authors</span>
+            <div class="author-list">
+              ${job.authorInfo.authors.map(a => `<div class="author-entry">${escHtml(a)}</div>`).join('')}
+            </div>
+            ${job.authorInfo.institutions?.length > 0 ? `<span class="rail-muted">${escHtml(job.authorInfo.institutions[0])}</span>` : ''}
+          </div>` : ''}
           <div class="rail-block">
             <span class="rail-label">Content inventory</span>
             <dl class="inventory">
@@ -367,6 +461,11 @@ function render() {
             ${renderOutput('Change log', 'changelog', job.outputs.changelog)}
           </div>
           ${job.reasoning ? renderReasoning(job.reasoning) : ''}
+          <div class="rail-block">
+            <button class="rail-chat-btn" type="button" id="rail-chat-open">
+              ${icons.chat} Chat with agent
+            </button>
+          </div>
           <div class="approval-note">
             <span class="note-icon">${icons.info}</span>
             <p><strong>Human in the loop</strong>PaperForge never changes claims, data, or authorship without your approval.</p>
@@ -376,6 +475,12 @@ function render() {
     </main>
   `;
   bindEvents();
+
+  // Scroll chat to bottom
+  if (showChat) {
+    const chatMsgs = document.querySelector('#chat-messages');
+    if (chatMsgs) chatMsgs.scrollTop = chatMsgs.scrollHeight;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -406,11 +511,12 @@ function renderLedger(stage) {
 }
 
 // ---------------------------------------------------------------------------
-// Finding row
+// Finding row — with "Ask agent" button
 // ---------------------------------------------------------------------------
 function renderFinding(finding) {
   const tone = finding.severity === 'pass' ? 'success' : finding.severity;
   const needsApproval = finding.approval && finding.severity !== 'pass';
+  const findingId = finding.id ?? finding.rule;
   return `<article class="finding-row">
     <div class="finding-icon ${tone}">${finding.severity === 'pass' ? icons.check : icons.info}</div>
     <div class="finding-copy">
@@ -425,8 +531,14 @@ function renderFinding(finding) {
         ${finding.location ? `<span>${escHtml(finding.location)}</span>` : ''}
         <span>${Math.round((finding.confidence ?? 0) * 100)}% confidence</span>
       </div>
+      ${finding.severity !== 'pass' ? `
+        <div class="finding-actions">
+          <button class="finding-chat-btn" type="button" data-finding-chat="${escHtml(findingId)}" data-finding-title="${escHtml(finding.title ?? finding.rule)}">
+            ${icons.chat} Ask agent to fix
+          </button>
+        </div>` : ''}
     </div>
-    <button class="icon-button finding-action" type="button" aria-label="View rationale for ${escHtml(finding.rule)}" data-finding="${finding.id ?? finding.rule}">${icons.arrow}</button>
+    <button class="icon-button finding-action" type="button" aria-label="View rationale for ${escHtml(finding.rule)}" data-finding="${findingId}">${icons.arrow}</button>
   </article>`;
 }
 
@@ -442,7 +554,55 @@ function renderOutput(label, key, available) {
 }
 
 // ---------------------------------------------------------------------------
-// Upload state: selected bib file ref
+// Chat: send a message
+// ---------------------------------------------------------------------------
+async function sendChatMessage(message) {
+  if (!job?.real || !message.trim() || chatLoading) return;
+
+  chatHistory.push({ role: 'user', content: message.trim(), timestamp: new Date().toISOString() });
+  chatLoading = true;
+  showChat = true;
+  render();
+
+  try {
+    const r = await fetch(`/api/jobs/${job.id}/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ message: message.trim() }),
+    });
+    if (!r.ok) throw new Error('Chat request failed.');
+    const data = await r.json();
+    chatHistory = data.history ?? chatHistory;
+  } catch (err) {
+    chatHistory.push({
+      role: 'assistant',
+      content: `Sorry, I couldn't process that request. ${err.message}`,
+      timestamp: new Date().toISOString(),
+    });
+  } finally {
+    chatLoading = false;
+    render();
+    // Scroll to bottom
+    const chatMsgs = document.querySelector('#chat-messages');
+    if (chatMsgs) chatMsgs.scrollTop = chatMsgs.scrollHeight;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Chat: load history from server
+// ---------------------------------------------------------------------------
+async function loadChatHistory(id) {
+  try {
+    const r = await fetch(`/api/jobs/${id}/chat`);
+    if (r.ok) {
+      const data = await r.json();
+      chatHistory = data.history ?? [];
+    }
+  } catch { /* ignore */ }
+}
+
+// ---------------------------------------------------------------------------
+// Upload state
 // ---------------------------------------------------------------------------
 let selectedBibFile = null;
 
@@ -456,6 +616,7 @@ function bindUploadEvents() {
   });
   document.querySelector('#demo-button')?.addEventListener('click', () => {
     job = createDemoJob(); findingFilter = 'all'; diffData = null; showDiff = false;
+    chatHistory = []; showChat = false;
     announce('Demo job loaded.');
     render();
   });
@@ -484,9 +645,9 @@ async function handleManuscriptChange(event) {
     if (!response.ok) throw new Error((await response.json()).error || 'Upload failed.');
     const serverJob = await response.json();
     job = normalizeServerJob(serverJob);
-    diffData = null; showDiff = false;
+    diffData = null; showDiff = false; chatHistory = []; showChat = false;
     render();
-    connectSSE(serverJob.id); // switch to SSE for real-time updates
+    connectSSE(serverJob.id);
   } catch (error) {
     announce(error.message);
   }
@@ -499,7 +660,7 @@ function bindEvents() {
   // Replace manuscript
   document.querySelector('#manuscript-input-replace')?.addEventListener('change', handleManuscriptChange);
 
-  // Target change (demo only — real job already submitted)
+  // Target change (demo only)
   document.querySelector('#target-select')?.addEventListener('change', (e) => {
     if (!job.real) { job = { ...job, target: e.target.value }; announce(`Target template changed to ${e.target.value}.`); render(); }
   });
@@ -519,6 +680,7 @@ function bindEvents() {
   document.querySelector('#reset-button')?.addEventListener('click', () => {
     if (sseController) { sseController.abort(); sseController = null; }
     job = null; findingFilter = 'all'; diffData = null; showDiff = false;
+    chatHistory = []; showChat = false;
     announce('Workspace reset. Upload a manuscript to begin.');
     render();
   });
@@ -590,6 +752,88 @@ function bindEvents() {
       const finding = job.findings.find((f) => (f.id ?? f.rule) === btn.dataset.finding);
       if (finding) announce(`${finding.rule}: ${finding.detail} ${finding.approval ? 'Approval required.' : ''}`);
     }));
+
+  // Finding "Ask agent to fix" buttons
+  document.querySelectorAll('[data-finding-chat]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const title = btn.dataset.findingTitle;
+      showChat = true;
+      render();
+      // Pre-fill with context
+      const input = document.querySelector('#chat-input');
+      if (input) {
+        input.value = `Help me fix this issue: "${title}"`;
+        input.focus();
+      }
+    });
+  });
+
+  // Chat open from intent panel
+  document.querySelector('#open-chat-inline')?.addEventListener('click', () => {
+    showChat = true; render();
+    const input = document.querySelector('#chat-input');
+    if (input) input.focus();
+  });
+
+  // Chat open from topbar
+  document.querySelector('#topbar-chat-toggle')?.addEventListener('click', () => {
+    showChat = !showChat; render();
+    if (showChat) {
+      const input = document.querySelector('#chat-input');
+      if (input) input.focus();
+    }
+  });
+
+  // Chat open from rail
+  document.querySelector('#rail-chat-open')?.addEventListener('click', () => {
+    showChat = true; render();
+    const input = document.querySelector('#chat-input');
+    if (input) input.focus();
+  });
+
+  // Sidebar chat nav
+  document.querySelector('#nav-chat')?.addEventListener('click', () => {
+    showChat = !showChat; render();
+    if (showChat) {
+      const input = document.querySelector('#chat-input');
+      if (input) input.focus();
+    }
+  });
+
+  // Chat close
+  document.querySelector('#chat-close-button')?.addEventListener('click', () => {
+    showChat = false; render();
+  });
+
+  // Chat send
+  document.querySelector('#chat-send-button')?.addEventListener('click', () => {
+    const input = document.querySelector('#chat-input');
+    if (input && input.value.trim()) {
+      const msg = input.value;
+      input.value = '';
+      sendChatMessage(msg);
+    }
+  });
+
+  // Chat textarea — Enter to send (Shift+Enter for newline)
+  document.querySelector('#chat-input')?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      const input = e.target;
+      if (input.value.trim()) {
+        const msg = input.value;
+        input.value = '';
+        sendChatMessage(msg);
+      }
+    }
+  });
+
+  // Quick-action chat buttons
+  document.querySelectorAll('[data-quick]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      sendChatMessage(btn.dataset.quick);
+    });
+  });
 
   // Outputs
   document.querySelectorAll('[data-output]').forEach((btn) =>

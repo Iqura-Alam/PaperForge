@@ -5,7 +5,7 @@ import { mkdir, readFile, writeFile, readdir, rm, stat } from 'node:fs/promises'
 import Busboy from 'busboy';
 import {
   askReasoning, buildLatex, compileLatex, extractDocx,
-  repairLatex, validateLatex, validateUpload, LIMITS, TEMPLATE_IDS,
+  repairLatex, validateLatex, validateUpload, chatWithAgent, LIMITS, TEMPLATE_IDS,
 } from './pipeline.mjs';
 
 const root = path.resolve('.');
@@ -44,7 +44,14 @@ function publicJob(job) {
   return {
     ...safe,
     document: doc
-      ? { figures: doc.figures, tables: doc.tables.length, references: doc.references, imageHeavy: doc.imageHeavy }
+      ? {
+          figures: doc.figures,
+          tables: doc.tables.length,
+          references: doc.references,
+          imageHeavy: doc.imageHeavy,
+          authorInfo: doc.authorInfo,
+          imageMap: doc.imageMap,
+        }
       : undefined,
     compile: job.compile
       ? { ok: job.compile.ok, pdf: job.compile.pdf, timedOut: job.compile.timedOut }
@@ -97,6 +104,20 @@ async function parseUpload(req) {
 }
 
 // ---------------------------------------------------------------------------
+// Parse JSON body
+// ---------------------------------------------------------------------------
+async function parseJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      try { resolve(JSON.parse(body)); } catch { reject(new Error('Invalid JSON body.')); }
+    });
+    req.on('error', reject);
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Bibliography citation-key reconciliation
 // ---------------------------------------------------------------------------
 function reconcileCitations(source, bibContent) {
@@ -142,7 +163,7 @@ async function compileWithRepairs(job) {
         severity: 'error', rule: 'repair-budget-exhausted',
         title: `Compilation failed after ${MAX_REPAIRS} repair attempt(s)`,
         confidence: 1,
-        detail: 'Automatic repair budget is exhausted. Manual review of the generated LaTeX source is required.',
+        detail: 'Automatic repair budget is exhausted. Use the chat below to ask the agent for help or download the LaTeX source for manual review.',
         approval: false,
       });
       break;
@@ -184,10 +205,10 @@ async function waitForApproval(job) {
 async function processJob(job) {
   activeJobCount.value += 1;
   try {
-    // Extract
+    // Extract — pass jobDir so images can be saved
     job.stage = 'Converting'; job.progress = 28;
     pushJobUpdate(job);
-    job.document = await extractDocx(job.buffer, job.filename);
+    job.document = await extractDocx(job.buffer, job.filename, job.dir);
 
     // Image-heavy consent gate
     if (isImageHeavy(job.document) && !job.imageHeavyConsent) {
@@ -197,7 +218,7 @@ async function processJob(job) {
         severity: 'warning', rule: 'image-heavy',
         title: `${job.document.figures} images detected — consent required`,
         confidence: 1,
-        detail: 'This document is image-heavy. Extraction will proceed but image assets cannot be embedded automatically. Send POST /api/jobs/:id/consent to continue.',
+        detail: 'This document is image-heavy. Extraction will proceed but image assets may require manual verification. Send POST /api/jobs/:id/consent to continue.',
         approval: true,
       }];
       pushJobUpdate(job);
@@ -255,7 +276,7 @@ async function processJob(job) {
         severity: 'error', rule: 'compilation',
         title: job.compile.timedOut ? 'Compilation timed out' : 'Compilation failed',
         confidence: 1,
-        detail: 'Review compiler log and generated source. Manual correction required.',
+        detail: 'Review compiler log and generated source. Use the agent chat to ask for help with specific errors.',
         approval: false,
       });
     }
@@ -264,6 +285,17 @@ async function processJob(job) {
     job.stage = 'Reasoning'; job.progress = 88;
     pushJobUpdate(job);
     job.reasoning = await askReasoning({ findings: job.findings, document: job.document, jobId: job.id });
+
+    // Initialise chat history
+    if (!job.chatHistory) {
+      job.chatHistory = [{
+        role: 'assistant',
+        content: job.reasoning?.summary
+          ? `I've reviewed your document. ${job.reasoning.summary} How can I help you refine the output?`
+          : 'Your document has been converted. How can I help you refine the output?',
+        timestamp: new Date().toISOString(),
+      }];
+    }
 
     // Finalise
     job.stage = 'Ready'; job.progress = 100; job.status = 'ready';
@@ -289,6 +321,14 @@ async function processJob(job) {
   } catch (error) {
     job.status = 'error'; job.stage = 'Escalated';
     job.error = error.message; job.progress = 100;
+    // Still init chat history so user can ask about the error
+    if (!job.chatHistory) {
+      job.chatHistory = [{
+        role: 'assistant',
+        content: `An error occurred during conversion: ${error.message}. I can help you understand what went wrong or suggest next steps.`,
+        timestamp: new Date().toISOString(),
+      }];
+    }
     pushJobUpdate(job);
     const subs = sseSubscribers.get(job.id);
     if (subs) { for (const res of subs) { try { res.write(`event: error\ndata: ${JSON.stringify({ error: error.message })}\n\n`); res.end(); } catch { /* ignore */ } } sseSubscribers.delete(job.id); }
@@ -326,7 +366,7 @@ setInterval(runRetentionCleanup, 6 * 60 * 60 * 1000);
 // HTTP server
 // ---------------------------------------------------------------------------
 const server = http.createServer(async (req, res) => {
-  // CORS / HSTS / security headers for all responses
+  // Security headers for all responses
   res.setHeader('x-frame-options', 'DENY');
   res.setHeader('x-content-type-options', 'nosniff');
 
@@ -334,9 +374,10 @@ const server = http.createServer(async (req, res) => {
     // Health
     if (req.method === 'GET' && req.url === '/api/health') {
       return json(res, 200, {
-        ok: true, service: 'paperforge', version: '0.2.0',
+        ok: true, service: 'paperforge', version: '0.3.0',
         jobs: jobs.size, activeJobs: activeJobCount.value,
         uptime: process.uptime(),
+        gemini: Boolean(process.env.GEMINI_API_KEY),
       });
     }
 
@@ -366,6 +407,7 @@ const server = http.createServer(async (req, res) => {
         createdAt: new Date().toISOString(),
         findings: [], repairsUsed: 0, repairLog: [],
         sourceOriginal: null,
+        chatHistory: [],
       };
       jobs.set(id, job);
       processJob(job); // fire-and-forget
@@ -404,6 +446,60 @@ const server = http.createServer(async (req, res) => {
         hasChanges: original !== current,
         repairs: job.repairLog ?? [],
       });
+    }
+
+    // GET /api/jobs/:id/chat — get chat history
+    const matchChatGet = req.url.match(/^\/api\/jobs\/([^/]+)\/chat$/);
+    if (req.method === 'GET' && matchChatGet) {
+      const job = jobs.get(matchChatGet[1]);
+      if (!job) return json(res, 404, { error: 'Job not found.' });
+      return json(res, 200, { jobId: job.id, history: job.chatHistory ?? [] });
+    }
+
+    // POST /api/jobs/:id/chat — send a chat message
+    const matchChatPost = req.url.match(/^\/api\/jobs\/([^/]+)\/chat$/);
+    if (req.method === 'POST' && matchChatPost) {
+      const job = jobs.get(matchChatPost[1]);
+      if (!job) return json(res, 404, { error: 'Job not found.' });
+
+      let body;
+      try { body = await parseJsonBody(req); } catch { return json(res, 400, { error: 'Invalid JSON body.' }); }
+
+      const userMessage = String(body.message ?? '').trim();
+      if (!userMessage) return json(res, 400, { error: 'message is required.' });
+
+      if (!job.chatHistory) job.chatHistory = [];
+
+      // Add user message to history
+      const userEntry = { role: 'user', content: userMessage, timestamp: new Date().toISOString() };
+      job.chatHistory.push(userEntry);
+
+      // Build messages array for AI (last N turns to keep context bounded)
+      const contextMessages = job.chatHistory.slice(-20).map((m) => ({
+        role: m.role,
+        content: m.content,
+      }));
+
+      // Call agent
+      const agentResponse = await chatWithAgent({
+        jobId: job.id,
+        messages: contextMessages,
+        job,
+      });
+
+      const assistantEntry = {
+        role: 'assistant',
+        content: agentResponse.message ?? agentResponse.summary ?? JSON.stringify(agentResponse),
+        action: agentResponse.action,
+        patch: agentResponse.patch,
+        timestamp: new Date().toISOString(),
+      };
+      job.chatHistory.push(assistantEntry);
+
+      // If agent suggested a patch, emit SSE update
+      pushJobUpdate(job);
+
+      return json(res, 200, { userEntry, assistantEntry, history: job.chatHistory });
     }
 
     // GET /api/jobs/:id[/output/:type]
@@ -455,7 +551,6 @@ const server = http.createServer(async (req, res) => {
       job.source = job.sourceOriginal;
       job.repairLog = [];
       job.repairsUsed = 0;
-      // Overwrite paper.tex with original
       await writeFile(path.join(job.dir, 'paper.tex'), job.source, 'utf8');
       job.status = 'rolled-back';
       job.stage = 'Rolled back';
@@ -468,7 +563,6 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'DELETE' && matchDelete) {
       const job = jobs.get(matchDelete[1]);
       if (!job) return json(res, 404, { error: 'Job not found.' });
-      // If awaiting approval, resolve so the pipeline can clean up
       if (typeof job.approvalResolve === 'function') { job.approvalResolve(); delete job.approvalResolve; }
       job.status = 'cancelled'; job.stage = 'Cancelled'; job.progress = 0;
       pushJobUpdate(job);
