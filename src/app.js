@@ -31,9 +31,14 @@ let findingFilter = 'all';
 let diffData = null;
 let showDiff = false;
 let showChat = false;
+let chatAutoOpened = false;
 let sseController = null;
 let chatHistory = [];
 let chatLoading = false;
+// Two-step upload state
+let selectedManuscriptFile = null;
+let selectedBibFile = null;
+let stagingTarget = 'IEEEtran';
 
 // ---------------------------------------------------------------------------
 // Utility: normalise server job into local shape
@@ -107,6 +112,47 @@ const announce = (msg) => { document.querySelector('#live-region').textContent =
 // Upload prompt (no job loaded)
 // ---------------------------------------------------------------------------
 function renderUploadPrompt() {
+  // Stage A: no file selected yet — show picker
+  if (!selectedManuscriptFile) {
+    return `
+      <aside class="sidebar" aria-label="Primary navigation">
+        <div class="brand"><span class="brand-mark">P</span><span>PaperForge</span></div>
+        <nav class="nav-list">
+          <button class="nav-item active" type="button" id="nav-workspace" data-nav="workspace"><span class="nav-icon">${icons.file}</span>Workspace</button>
+          <button class="nav-item" type="button" id="nav-templates" data-nav="templates"><span class="nav-icon">${icons.spark}</span>Templates</button>
+        </nav>
+        <div class="sidebar-bottom">
+          <div class="storage-note"><span class="storage-line"></span><div><strong>Privacy mode</strong><span>Deletes after 24 h</span></div></div>
+        </div>
+      </aside>
+      <main class="main-shell">
+        <header class="topbar">
+          <div class="crumbs"><span>Workspace</span><span class="crumb-rule"></span><strong>No manuscript loaded</strong></div>
+          <div class="top-actions"><span class="secure-label">${icons.check} Local session</span></div>
+        </header>
+        <div class="workbench">
+          <section class="workspace-column" aria-labelledby="page-title">
+            <div class="page-heading"><div>
+              <h1 id="page-title">Upload your manuscript</h1>
+              <p>PaperForge converts DOCX to IEEE or ACM LaTeX while preserving your science and showing every step.</p>
+            </div></div>
+            <section class="upload-zone" aria-label="Upload area">
+              <div class="upload-icon">${icons.upload}</div>
+              <h2>Choose a DOCX manuscript</h2>
+              <p class="upload-limits">Accepted: <strong>.docx</strong> · Max <strong>25 MB</strong> · Up to <strong>50 pages</strong>, <strong>50 figures</strong>, <strong>30 tables</strong>, <strong>300 references</strong></p>
+              <label class="primary-button" for="manuscript-input" id="upload-label">Select manuscript ${icons.arrow}</label>
+              <input id="manuscript-input" type="file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" aria-label="Select DOCX manuscript" hidden>
+              <p class="upload-privacy">${icons.info} Files are deleted automatically after download (max 24 hours). Content is never used for training without consent.</p>
+              <div class="demo-hint"><button class="text-button" id="demo-button" type="button">Try with demo data</button></div>
+            </section>
+          </section>
+        </div>
+      </main>
+    `;
+  }
+
+  // Stage B: file selected — show staging / confirm area
+  const sizeMB = (selectedManuscriptFile.size / 1024 / 1024).toFixed(1);
   return `
     <aside class="sidebar" aria-label="Primary navigation">
       <div class="brand"><span class="brand-mark">P</span><span>PaperForge</span></div>
@@ -120,39 +166,52 @@ function renderUploadPrompt() {
     </aside>
     <main class="main-shell">
       <header class="topbar">
-        <div class="crumbs"><span>Workspace</span><span class="crumb-rule"></span><strong>No manuscript loaded</strong></div>
+        <div class="crumbs"><span>Workspace</span><span class="crumb-rule"></span><strong>${selectedManuscriptFile.name}</strong></div>
         <div class="top-actions"><span class="secure-label">${icons.check} Local session</span></div>
       </header>
       <div class="workbench">
         <section class="workspace-column" aria-labelledby="page-title">
-          <div class="page-heading">
-            <div>
-              <h1 id="page-title">Upload your manuscript</h1>
-              <p>PaperForge converts DOCX to IEEE or ACM LaTeX while preserving your science and showing every step.</p>
+          <div class="page-heading"><div>
+            <h1 id="page-title">Ready to convert</h1>
+            <p>Optionally attach a bibliography, choose a template, then start conversion.</p>
+          </div></div>
+
+          <section class="staging-zone" aria-label="Conversion staging">
+            <div class="staging-file-row">
+              <span class="staging-icon">${icons.file}</span>
+              <div class="staging-file-info">
+                <strong>${escHtml(selectedManuscriptFile.name)}</strong>
+                <span>${sizeMB} MB · DOCX manuscript ready</span>
+              </div>
+              <button class="text-button" id="change-file-btn" type="button">Change file</button>
             </div>
-          </div>
-          <section class="upload-zone" aria-label="Upload area">
-            <div class="upload-icon">${icons.upload}</div>
-            <h2>Choose a DOCX manuscript</h2>
-            <p class="upload-limits">Accepted: <strong>.docx</strong> · Max <strong>25 MB</strong> · Up to <strong>50 pages</strong>, <strong>50 figures</strong>, <strong>30 tables</strong>, <strong>300 references</strong></p>
-            <label class="primary-button" for="manuscript-input" id="upload-label">Select manuscript ${icons.arrow}</label>
-            <input id="manuscript-input" type="file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" aria-label="Select DOCX manuscript" hidden>
-            <div class="upload-bib-row">
-              <label class="bib-label" for="bib-input">${icons.bib} Optional bibliography (.bib file)</label>
-              <input id="bib-input" type="file" accept=".bib,text/plain" aria-label="Select optional BibTeX file" hidden>
-              <label class="bib-button" for="bib-input" id="bib-button-label">Choose .bib ${icons.arrow}</label>
-              <span id="bib-name" class="bib-name"></span>
+
+            <div class="staging-row">
+              <label class="staging-label" for="target-select-staging">Output template</label>
+              <select id="target-select-staging" class="staging-select">
+                <option value="IEEEtran" ${stagingTarget === 'IEEEtran' ? 'selected' : ''}>IEEE Conference / Transactions</option>
+                <option value="acmart" ${stagingTarget === 'acmart' ? 'selected' : ''}>ACM Conference / Journal</option>
+                <option value="acl" ${stagingTarget === 'acl' ? 'selected' : ''}>ACL / EMNLP / NAACL</option>
+                <option value="springer" ${stagingTarget === 'springer' ? 'selected' : ''}>Springer LNCS</option>
+                <option value="icml" ${stagingTarget === 'icml' ? 'selected' : ''}>ICML / PMLR</option>
+                <option value="iclr" ${stagingTarget === 'iclr' ? 'selected' : ''}>ICLR</option>
+              </select>
             </div>
-            <label class="select-wrap" style="margin-top:12px">Output template<select id="target-select">
-              <option value="IEEEtran">IEEE Conference / Transactions</option>
-              <option value="acmart">ACM Conference / Journal</option>
-              <option value="acl">ACL / EMNLP / NAACL</option>
-              <option value="springer">Springer LNCS</option>
-              <option value="icml">ICML / PMLR</option>
-              <option value="iclr">ICLR</option>
-            </select></label>
-            <p class="upload-privacy">${icons.info} Files are deleted automatically after download (max 24 hours). Content is never used for training without consent.</p>
-            <div class="demo-hint"><button class="text-button" id="demo-button" type="button">Try with demo data</button></div>
+
+            <div class="staging-row">
+              <label class="staging-label">Bibliography (optional)</label>
+              <div class="staging-bib-row">
+                <label class="bib-button" for="bib-input-staging">Choose .bib file ${icons.arrow}</label>
+                <input id="bib-input-staging" type="file" accept=".bib,text/plain" aria-label="Select optional BibTeX file" hidden>
+                <span id="bib-name-staging" class="bib-name">${selectedBibFile ? escHtml(selectedBibFile.name) : 'No file chosen'}</span>
+              </div>
+              <p class="staging-note">${icons.info} Attaching a .bib file enables citation key verification and auto-inserts a \bibliography{} command.</p>
+            </div>
+
+            <div class="staging-actions">
+              <button class="primary-button" id="confirm-upload-btn" type="button">Start conversion ${icons.arrow}</button>
+              <p class="upload-privacy">${icons.info} Files are deleted automatically within 24 hours. Content is never used for training without consent.</p>
+            </div>
           </section>
         </section>
       </div>
@@ -204,10 +263,9 @@ function renderDiffPanel() {
 }
 
 // ---------------------------------------------------------------------------
-// Chat panel
+// Chat panel (content only — injected into drawer)
 // ---------------------------------------------------------------------------
-function renderChatPanel() {
-  if (!showChat) return '';
+function renderChatPanelContent() {
 
   const messages = chatHistory.map((msg) => {
     const isUser = msg.role === 'user';
@@ -233,40 +291,39 @@ function renderChatPanel() {
     : '';
 
   return `
-    <section class="chat-panel" aria-labelledby="chat-title">
-      <div class="chat-header">
-        <div class="chat-title-row">
-          <span class="chat-icon">${icons.chat}</span>
-          <div>
-            <h2 id="chat-title">Agent assistant</h2>
-            <p class="chat-subtitle">Ask about findings, request fixes, or get help with the LaTeX output</p>
-          </div>
+    <div class="chat-header">
+      <div class="chat-title-row">
+        <span class="chat-icon">${icons.chat}</span>
+        <div>
+          <h2 id="chat-title">Agent assistant</h2>
+          <p class="chat-subtitle">Ask about findings, request fixes, or get help with the LaTeX output</p>
         </div>
-        <button class="icon-button chat-close-btn" type="button" id="chat-close-button" aria-label="Close chat">${icons.close}</button>
       </div>
-      <div class="chat-messages" id="chat-messages" aria-live="polite" aria-label="Conversation">
-        ${messages || '<div class="chat-empty"><p>Ask me anything about your converted document — findings, formatting, LaTeX syntax, or how to fix specific issues.</p></div>'}
-        ${loadingMsg}
-      </div>
-      <div class="chat-input-row">
-        <textarea
-          id="chat-input"
-          class="chat-textarea"
-          placeholder="Ask the agent… e.g. 'Why is Table 2 misaligned?' or 'Fix the author block'"
-          rows="2"
-          aria-label="Chat message"
-        ></textarea>
-        <button class="chat-send-btn" type="button" id="chat-send-button" aria-label="Send message" ${chatLoading ? 'disabled' : ''}>
-          ${icons.send}
-        </button>
-      </div>
-      <div class="chat-quick-actions">
-        <button class="chat-quick-btn" type="button" data-quick="Explain the validation findings">Explain findings</button>
-        <button class="chat-quick-btn" type="button" data-quick="How do I fix the author and institution block?">Fix author block</button>
-        <button class="chat-quick-btn" type="button" data-quick="Why are my tables not rendering correctly?">Table issues</button>
-        <button class="chat-quick-btn" type="button" data-quick="How do I add my images to the LaTeX source?">Image help</button>
-      </div>
-    </section>`;
+      <button class="icon-button chat-close-btn" type="button" id="chat-close-button" aria-label="Close chat">${icons.close}</button>
+    </div>
+    <div class="chat-messages" id="chat-messages" aria-live="polite" aria-label="Conversation">
+      ${messages || '<div class="chat-empty"><p>Ask me anything about your converted document — findings, formatting, LaTeX syntax, or how to fix specific issues.</p></div>'}
+      ${loadingMsg}
+    </div>
+    <div class="chat-input-row">
+      <textarea
+        id="chat-input"
+        class="chat-textarea"
+        placeholder="Ask the agent… e.g. &#39;Why is Table 2 misaligned?&#39;"
+        rows="2"
+        aria-label="Chat message"
+      ></textarea>
+      <button class="chat-send-btn" type="button" id="chat-send-button" aria-label="Send message" ${chatLoading ? 'disabled' : ''}>
+        ${icons.send}
+      </button>
+    </div>
+    <div class="chat-quick-actions">
+      <button class="chat-quick-btn" type="button" data-quick="Explain the validation findings">Explain findings</button>
+      <button class="chat-quick-btn" type="button" data-quick="How do I fix the author and institution block?">Fix author block</button>
+      <button class="chat-quick-btn" type="button" data-quick="Why are my tables not rendering correctly?">Table issues</button>
+      <button class="chat-quick-btn" type="button" data-quick="How do I add my images to the LaTeX source?">Image help</button>
+    </div>
+  `;
 }
 
 function escHtml(s) {
@@ -421,8 +478,7 @@ function render() {
             <div class="findings-list">${findings.map(renderFinding).join('')}</div>
           </section>
 
-          ${renderChatPanel()}
-        </section>
+          </section>
 
         <aside class="detail-rail" aria-label="Job details">
           <div class="rail-heading"><span>Job details</span></div>
@@ -476,11 +532,79 @@ function render() {
   `;
   bindEvents();
 
-  // Scroll chat to bottom
-  if (showChat) {
-    const chatMsgs = document.querySelector('#chat-messages');
-    if (chatMsgs) chatMsgs.scrollTop = chatMsgs.scrollHeight;
+  // Auto-open chat drawer once when job reaches terminal state (first time only)
+  if (job?.real && ['ready', 'error'].includes(job.status) && !chatAutoOpened) {
+    chatAutoOpened = true;
+    showChat = true;
   }
+
+  // Inject chat drawer into main shell (fixed position, not in scrollable column)
+  injectChatDrawer();
+}
+
+// ---------------------------------------------------------------------------
+// Chat drawer injection (FAB + fixed panel)
+// ---------------------------------------------------------------------------
+function injectChatDrawer() {
+  if (!job?.real) {
+    // Remove any leftover drawer/FAB from previous session
+    document.querySelector('#chat-drawer')?.remove();
+    document.querySelector('#chat-fab')?.remove();
+    return;
+  }
+
+  const mainShell = document.querySelector('.main-shell');
+  if (!mainShell) return;
+
+  // Drawer
+  let drawer = document.querySelector('#chat-drawer');
+  if (!drawer) {
+    drawer = document.createElement('div');
+    drawer.id = 'chat-drawer';
+    drawer.setAttribute('role', 'complementary');
+    drawer.setAttribute('aria-label', 'Agent chat panel');
+    mainShell.appendChild(drawer);
+  }
+  drawer.className = `chat-drawer${showChat ? ' open' : ''}`;
+  drawer.innerHTML = renderChatPanelContent();
+  bindChatDrawerEvents(drawer);
+
+  // FAB
+  let fab = document.querySelector('#chat-fab');
+  if (!fab) {
+    fab = document.createElement('button');
+    fab.id = 'chat-fab';
+    fab.type = 'button';
+    document.body.appendChild(fab);
+  }
+  fab.className = 'chat-fab';
+  const unread = chatHistory.filter(m => m.role === 'assistant').length;
+  fab.innerHTML = `${icons.chat} ${showChat ? 'Close chat' : 'Ask agent'}${unread > 0 ? ` <span class="chat-badge">${unread}</span>` : ''}`;
+  fab.onclick = () => { showChat = !showChat; injectChatDrawer(); };
+
+  // Scroll messages to bottom
+  if (showChat) {
+    const msgs = drawer.querySelector('#chat-messages');
+    if (msgs) msgs.scrollTop = msgs.scrollHeight;
+  }
+}
+
+function bindChatDrawerEvents(drawer) {
+  drawer.querySelector('#chat-close-button')?.addEventListener('click', () => {
+    showChat = false; injectChatDrawer();
+  });
+  drawer.querySelector('#chat-send-button')?.addEventListener('click', () => {
+    const inp = drawer.querySelector('#chat-input');
+    if (inp?.value.trim()) { const m = inp.value; inp.value = ''; sendChatMessage(m); }
+  });
+  drawer.querySelector('#chat-input')?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      if (e.target.value.trim()) { const m = e.target.value; e.target.value = ''; sendChatMessage(m); }
+    }
+  });
+  drawer.querySelectorAll('[data-quick]').forEach(btn =>
+    btn.addEventListener('click', () => sendChatMessage(btn.dataset.quick)));
 }
 
 // ---------------------------------------------------------------------------
@@ -562,7 +686,7 @@ async function sendChatMessage(message) {
   chatHistory.push({ role: 'user', content: message.trim(), timestamp: new Date().toISOString() });
   chatLoading = true;
   showChat = true;
-  render();
+  injectChatDrawer();
 
   try {
     const r = await fetch(`/api/jobs/${job.id}/chat`, {
@@ -581,10 +705,7 @@ async function sendChatMessage(message) {
     });
   } finally {
     chatLoading = false;
-    render();
-    // Scroll to bottom
-    const chatMsgs = document.querySelector('#chat-messages');
-    if (chatMsgs) chatMsgs.scrollTop = chatMsgs.scrollHeight;
+    injectChatDrawer();
   }
 }
 
@@ -601,30 +722,82 @@ async function loadChatHistory(id) {
   } catch { /* ignore */ }
 }
 
-// ---------------------------------------------------------------------------
-// Upload state
-// ---------------------------------------------------------------------------
-let selectedBibFile = null;
 
 function bindUploadEvents() {
-  document.querySelector('#manuscript-input')?.addEventListener('change', handleManuscriptChange);
-  document.querySelector('#bib-input')?.addEventListener('change', (e) => {
-    selectedBibFile = e.target.files?.[0] ?? null;
-    const nameEl = document.querySelector('#bib-name');
-    if (nameEl) nameEl.textContent = selectedBibFile ? selectedBibFile.name : '';
-    announce(selectedBibFile ? `Bibliography file selected: ${selectedBibFile.name}` : 'Bibliography file cleared.');
-  });
+  // Stage A: manuscript file picker — only stores file, shows staging view
+  document.querySelector('#manuscript-input')?.addEventListener('change', handleManuscriptSelect);
+  // Stage A: demo button
   document.querySelector('#demo-button')?.addEventListener('click', () => {
+    selectedManuscriptFile = null; selectedBibFile = null;
     job = createDemoJob(); findingFilter = 'all'; diffData = null; showDiff = false;
-    chatHistory = []; showChat = false;
+    chatHistory = []; showChat = false; chatAutoOpened = false;
     announce('Demo job loaded.');
     render();
+  });
+  // Stage B: target select
+  document.querySelector('#target-select-staging')?.addEventListener('change', (e) => {
+    stagingTarget = e.target.value;
+  });
+  // Stage B: bib file picker
+  document.querySelector('#bib-input-staging')?.addEventListener('change', (e) => {
+    selectedBibFile = e.target.files?.[0] ?? null;
+    const nameEl = document.querySelector('#bib-name-staging');
+    if (nameEl) nameEl.textContent = selectedBibFile ? selectedBibFile.name : 'No file chosen';
+    announce(selectedBibFile ? `Bibliography file selected: ${selectedBibFile.name}` : 'Bibliography file cleared.');
+  });
+  // Stage B: change file button — resets staging
+  document.querySelector('#change-file-btn')?.addEventListener('click', () => {
+    selectedManuscriptFile = null; selectedBibFile = null;
+    render();
+  });
+  // Stage B: confirm and submit
+  document.querySelector('#confirm-upload-btn')?.addEventListener('click', () => {
+    submitUpload();
   });
 }
 
 // ---------------------------------------------------------------------------
-// Upload handler
+// Upload: Stage A — validate and store file, render staging view
 // ---------------------------------------------------------------------------
+function handleManuscriptSelect(event) {
+  const file = event.target.files?.[0];
+  if (!file) return;
+  const isDocx = file.name.toLowerCase().endsWith('.docx');
+  if (!isDocx) { announce('File rejected. Choose a DOCX manuscript.'); return; }
+  if (file.size > 25 * 1024 * 1024) { announce('File rejected. DOCX files must be 25 megabytes or smaller.'); return; }
+  selectedManuscriptFile = file;
+  selectedBibFile = null;
+  stagingTarget = 'IEEEtran';
+  announce(`${file.name} ready. Choose template and optional bibliography, then click Start conversion.`);
+  render(); // shows Stage B
+}
+
+// ---------------------------------------------------------------------------
+// Upload: Stage B — POST to server
+// ---------------------------------------------------------------------------
+async function submitUpload() {
+  if (!selectedManuscriptFile) return;
+  const form = new FormData();
+  form.append('manuscript', selectedManuscriptFile);
+  form.append('target', stagingTarget);
+  if (selectedBibFile) form.append('bibliography', selectedBibFile);
+
+  announce(`Uploading ${selectedManuscriptFile.name}…`);
+  try {
+    const response = await fetch('/api/jobs', { method: 'POST', body: form });
+    if (!response.ok) throw new Error((await response.json()).error || 'Upload failed.');
+    const serverJob = await response.json();
+    selectedManuscriptFile = null; selectedBibFile = null;
+    job = normalizeServerJob(serverJob);
+    diffData = null; showDiff = false; chatHistory = []; showChat = false; chatAutoOpened = false;
+    render();
+    connectSSE(serverJob.id);
+  } catch (error) {
+    announce(error.message);
+  }
+}
+
+// Keep for replace-manuscript (in-job flow)
 async function handleManuscriptChange(event) {
   const file = event.target.files?.[0];
   if (!file) return;
@@ -645,7 +818,7 @@ async function handleManuscriptChange(event) {
     if (!response.ok) throw new Error((await response.json()).error || 'Upload failed.');
     const serverJob = await response.json();
     job = normalizeServerJob(serverJob);
-    diffData = null; showDiff = false; chatHistory = []; showChat = false;
+    diffData = null; showDiff = false; chatHistory = []; showChat = false; chatAutoOpened = false;
     render();
     connectSSE(serverJob.id);
   } catch (error) {
@@ -654,15 +827,20 @@ async function handleManuscriptChange(event) {
 }
 
 // ---------------------------------------------------------------------------
-// Event binding
+// Event binding (workspace / job view)
 // ---------------------------------------------------------------------------
 function bindEvents() {
-  // Replace manuscript
+  // Replace manuscript (in-job)
   document.querySelector('#manuscript-input-replace')?.addEventListener('change', handleManuscriptChange);
 
-  // Target change (demo only)
-  document.querySelector('#target-select')?.addEventListener('change', (e) => {
-    if (!job.real) { job = { ...job, target: e.target.value }; announce(`Target template changed to ${e.target.value}.`); render(); }
+  // Reset workspace
+  document.querySelector('#reset-button')?.addEventListener('click', () => {
+    if (sseController) { sseController.abort(); sseController = null; }
+    job = null; findingFilter = 'all'; diffData = null; showDiff = false;
+    selectedManuscriptFile = null; selectedBibFile = null;
+    chatHistory = []; showChat = false; chatAutoOpened = false;
+    announce('Workspace reset. Upload a manuscript to begin.');
+    render();
   });
 
   // Start / advance demo
@@ -676,15 +854,6 @@ function bindEvents() {
     job = advanceJob(job); announce(`${job.stage} stage active.`); render();
   });
 
-  // Reset
-  document.querySelector('#reset-button')?.addEventListener('click', () => {
-    if (sseController) { sseController.abort(); sseController = null; }
-    job = null; findingFilter = 'all'; diffData = null; showDiff = false;
-    chatHistory = []; showChat = false;
-    announce('Workspace reset. Upload a manuscript to begin.');
-    render();
-  });
-
   // Cancel job
   document.querySelector('#cancel-button')?.addEventListener('click', async () => {
     if (!job?.real) return;
@@ -695,7 +864,7 @@ function bindEvents() {
     } catch { announce('Failed to cancel job.'); }
   });
 
-  // Approve
+  // Approve gate
   document.querySelector('#approve-button')?.addEventListener('click', async () => {
     if (!job?.real) return;
     try {
@@ -704,7 +873,7 @@ function bindEvents() {
     } catch { announce('Failed to send approval.'); }
   });
 
-  // Consent (image-heavy)
+  // Image-heavy consent
   document.querySelector('#consent-button')?.addEventListener('click', async () => {
     if (!job?.real) return;
     try {
@@ -716,7 +885,7 @@ function bindEvents() {
   // Rollback
   document.querySelector('#rollback-button')?.addEventListener('click', async () => {
     if (!job?.real) return;
-    if (!confirm('Roll back to pre-repair LaTeX source? This will overwrite the repaired paper.tex.')) return;
+    if (!confirm('Roll back to pre-repair LaTeX source?')) return;
     try {
       const r = await fetch(`/api/jobs/${job.id}/rollback`, { method: 'POST' });
       const body = await r.json();
@@ -738,8 +907,6 @@ function bindEvents() {
     }
     render();
   });
-
-  // Diff close
   document.querySelector('#diff-close-button')?.addEventListener('click', () => { showDiff = false; render(); });
 
   // Finding filters
@@ -753,87 +920,24 @@ function bindEvents() {
       if (finding) announce(`${finding.rule}: ${finding.detail} ${finding.approval ? 'Approval required.' : ''}`);
     }));
 
-  // Finding "Ask agent to fix" buttons
+  // Finding "Ask agent to fix" — open drawer and pre-fill
   document.querySelectorAll('[data-finding-chat]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const title = btn.dataset.findingTitle;
       showChat = true;
-      render();
-      // Pre-fill with context
+      injectChatDrawer();
       const input = document.querySelector('#chat-input');
-      if (input) {
-        input.value = `Help me fix this issue: "${title}"`;
-        input.focus();
-      }
+      if (input) { input.value = `Help me fix this issue: "${title}"`; input.focus(); }
     });
   });
 
-  // Chat open from intent panel
-  document.querySelector('#open-chat-inline')?.addEventListener('click', () => {
-    showChat = true; render();
-    const input = document.querySelector('#chat-input');
-    if (input) input.focus();
-  });
-
-  // Chat open from topbar
-  document.querySelector('#topbar-chat-toggle')?.addEventListener('click', () => {
-    showChat = !showChat; render();
-    if (showChat) {
-      const input = document.querySelector('#chat-input');
-      if (input) input.focus();
-    }
-  });
-
-  // Chat open from rail
-  document.querySelector('#rail-chat-open')?.addEventListener('click', () => {
-    showChat = true; render();
-    const input = document.querySelector('#chat-input');
-    if (input) input.focus();
-  });
-
-  // Sidebar chat nav
-  document.querySelector('#nav-chat')?.addEventListener('click', () => {
-    showChat = !showChat; render();
-    if (showChat) {
-      const input = document.querySelector('#chat-input');
-      if (input) input.focus();
-    }
-  });
-
-  // Chat close
-  document.querySelector('#chat-close-button')?.addEventListener('click', () => {
-    showChat = false; render();
-  });
-
-  // Chat send
-  document.querySelector('#chat-send-button')?.addEventListener('click', () => {
-    const input = document.querySelector('#chat-input');
-    if (input && input.value.trim()) {
-      const msg = input.value;
-      input.value = '';
-      sendChatMessage(msg);
-    }
-  });
-
-  // Chat textarea — Enter to send (Shift+Enter for newline)
-  document.querySelector('#chat-input')?.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      const input = e.target;
-      if (input.value.trim()) {
-        const msg = input.value;
-        input.value = '';
-        sendChatMessage(msg);
-      }
-    }
-  });
-
-  // Quick-action chat buttons
-  document.querySelectorAll('[data-quick]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      sendChatMessage(btn.dataset.quick);
-    });
-  });
+  // Chat toggles — all open/close the drawer (not a full re-render)
+  const openDrawer = () => { showChat = true; injectChatDrawer(); const i = document.querySelector('#chat-input'); if (i) i.focus(); };
+  const toggleDrawer = () => { showChat = !showChat; injectChatDrawer(); };
+  document.querySelector('#open-chat-inline')?.addEventListener('click', openDrawer);
+  document.querySelector('#topbar-chat-toggle')?.addEventListener('click', toggleDrawer);
+  document.querySelector('#rail-chat-open')?.addEventListener('click', openDrawer);
+  document.querySelector('#nav-chat')?.addEventListener('click', toggleDrawer);
 
   // Outputs
   document.querySelectorAll('[data-output]').forEach((btn) =>
@@ -842,9 +946,7 @@ function bindEvents() {
       if (job.real) {
         const a = document.createElement('a');
         a.href = `/api/jobs/${job.id}/output/${output}`;
-        a.download = '';
-        a.rel = 'noopener';
-        a.click();
+        a.download = ''; a.rel = 'noopener'; a.click();
       }
       announce(`${btn.querySelector('strong')?.textContent} download requested.`);
     }));
@@ -854,7 +956,6 @@ function bindEvents() {
     btn.addEventListener('click', () => {
       document.querySelectorAll('[data-nav]').forEach((b) => b.classList.remove('active'));
       btn.classList.add('active');
-      announce(`${btn.textContent.trim()} selected.`);
     }));
 }
 

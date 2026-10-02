@@ -28,6 +28,9 @@ export async function startTestServer() {
       NODE_ENV: 'test',
       GEMINI_API_KEY: '',
       OPENAI_API_KEY: '',
+      // Keep integration tests deterministic and fast: compilation should take
+      // the existing graceful "pdflatex not found" path in the test server.
+      PATH: '',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
